@@ -10,7 +10,11 @@
 sudo bash install.sh
 ```
 
-安装过程中可自定义端口、用户名、密码，直接回车则随机生成。也可沿用 `bash <(curl -fsSL URL)` 的一键方式，但 `URL` 必须指向你发布的修改版脚本；原上游链接不包含多出口功能。
+安装过程中可自定义端口、用户名、密码，直接回车则随机生成。也可在任意 Linux VPS 上直接运行：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/3055367319z-eng/socks5-setup/main/install.sh)
+```
 
 ## 📋 功能
 
