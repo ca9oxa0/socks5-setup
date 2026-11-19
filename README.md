@@ -142,6 +142,14 @@ bash build-routed-gost.sh "$PWD/gost-routed" # 用 Git 和本机 Go（1.21 或�
 sudo bash install.sh upgrade "$PWD/gost-routed"
 ```
 
+没有构建环境时可直接在线升级（仅提供 linux-amd64 资产；其他架构请本地构建）：
+
+```bash
+sudo bash install.sh upgrade https://github.com/ca9oxa0/socks5-setup/releases/download/v3.0.0-rc10-routed.1/gost-routed-linux-amd64
+```
+
+`upgrade` 和菜单「升级」都接受 `https://` 地址或本地绝对路径；只允许 HTTPS。下载内容会先通过路由契约校验，再替换程序并保留端口和用户，失败时恢复原安装。升级包地址可从 [Releases](https://github.com/ca9oxa0/socks5-setup/releases) 获取。
+
 ### 通过菜单配置出口
 
 运行 `sudo socks5`，选择「出口配置」，再选系统默认、按接入 IP 或按用户名。按用户名模式会引导你为账号填写本机出口 IP；未映射的账号不能转发。核对预览后确认应用。原本停止的服务只保存策略，不会被自动启动；运行中的服务会重启并检查监听，应用失败会尝试恢复旧策略和服务。两种绑定模式均需先按上节部署扩展二进制。
@@ -150,7 +158,7 @@ sudo bash install.sh upgrade "$PWD/gost-routed"
 
 ### 规则一：按用户名指定出口
 
-用 `sudoedit /etc/socks5/routes.conf` 编辑。首个非空、非注释行为 `username`，其余每行一个 `已存在的用户名=本机IP`。支持以 `#` 开头的整行注释，不要在 IP 后写行尾注释。每个用户名只能出现一次。映射用户名不要包含 `=`，也不要以 `#` 或空白开头；IPv6 地址直接填写，不加方括号或作用域后缀：
+用 `sudoedit /etc/socks5/routes.conf` 编辑。首个非空、非注释行为 `username`，其余每行一个 `已存在的用户名=本机IP`。支持以 `#` 开头的整行注释，不要在 IP 后写行尾注释。每个用户名只能出现一次。映射用户名不要包含 `=`；行首尾空白和等号两侧空白会被忽略；IPv6 地址直接填写，不加方括号或作用域后缀：
 
 ```text
 username

@@ -414,8 +414,15 @@ fi''', self.bindir)
         self.write(self.bindir / "gost-next", "")
         path = f"{self.base}/bin/gost-next"
         output = self.assert_menu_ok(f"12\nrelative\n{path}\ny\n0\n")
-        self.assertIn("请输入绝对路径", output)
+        self.assertIn("请输入 https 地址或绝对路径", output)
         self.assertIn(f"installer upgrade {path}", self.log())
+
+    def test_menu_upgrade_accepts_https_url(self):
+        self.write(self.config / "installer.sh", "#!/bin/bash\necho \"installer $*\" >> events\n")
+        url = "https://example.test/gost-routed"
+        output = self.assert_menu_ok(f"12\n{url}\ny\n0\n")
+        self.assertIn(url, output)
+        self.assertIn(f"installer upgrade {url}", self.log())
 
     def test_legacy_commands_still_work_with_pipes(self):
         self.assertIn("fixture-service-status", self.cli("status").stdout)

@@ -817,9 +817,11 @@ upgrade_menu() {
         info "自定义版本：${routed_version}"
     fi
     while :; do
-        IFS= read -rp "升级二进制绝对路径 (回车取消): " path || return 0
+        IFS= read -rp "升级包地址（https 或绝对路径，回车取消）: " path || return 0
         [[ -n "$path" ]] || return 0
-        if [[ "$path" != /* ]]; then warn "请输入绝对路径"; continue; fi
+        if [[ "$path" == https://* ]]; then break; fi
+        if [[ "$path" == http://* ]]; then warn "仅支持 https 下载"; continue; fi
+        if [[ "$path" != /* ]]; then warn "请输入 https 地址或绝对路径"; continue; fi
         if [[ ! -f "$path" || ! -r "$path" ]]; then warn "文件不存在或不可读"; continue; fi
         break
     done
@@ -1067,10 +1069,33 @@ do_update_cli() (
 # ============ 原地升级 ============
 do_upgrade() (
     check_root
-    [[ $# -eq 1 && "$1" == /* && -f "$1" && -r "$1" ]] ||
-        err "用法：sudo bash install.sh upgrade /absolute/path/to/gost-routed"
+    local src="" tmp=""
+    [[ $# -eq 1 ]] || err "用法：sudo bash install.sh upgrade <https://地址|绝对路径>"
     [[ -x "$GOST_BIN" && -f "$CONFIG_FILE" && -f "$USERS_FILE" && -f "$SERVICE_FILE" ]] ||
         err "未找到已有安装，请先运行 bash install.sh"
+    case "$1" in
+        https://*)
+            command -v curl >/dev/null 2>&1 || err "未找到 curl，无法在线下载"
+            tmp=$(mktemp /tmp/gost-routed.XXXXXX) || err "无法创建临时文件"
+            trap 'if [[ -n "$tmp" ]]; then rm -f -- "$tmp"; fi' EXIT
+            info "正在下载升级包..."
+            curl -fL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 300 -o "$tmp" "$1" ||
+                err "下载失败：$1"
+            [[ -s "$tmp" ]] || err "下载内容为空：$1"
+            chmod 700 "$tmp"
+            src=$tmp
+            ;;
+        http://*)
+            err "仅支持 https 下载；请使用 https 地址或本地绝对路径"
+            ;;
+        /*)
+            [[ -f "$1" && -r "$1" ]] || err "文件不存在或不可读：$1"
+            src=$1
+            ;;
+        *)
+            err "用法：sudo bash install.sh upgrade <https://地址|绝对路径>"
+            ;;
+    esac
 
     umask 077
     # 兼容旧安装曾以 0644 生成含明文凭据的 YAML。
@@ -1080,12 +1105,12 @@ do_upgrade() (
     local work port was_active=0 i path
     local -a targets=("$ROUTED_BIN" "$SOCKS5_CMD" "$CONFIG_FILE" "$SERVICE_FILE")
     work=$(mktemp -d "$CONFIG_DIR/.upgrade.XXXXXX")
-    trap 'rm -rf -- "$work"' EXIT
+    trap 'rm -rf -- "$work"; if [[ -n "$tmp" ]]; then rm -f -- "$tmp"; fi' EXIT
     write_socks5_cmd "$work/socks5"
     write_service "$work/service"
     port=$(bash "$work/socks5" _port)
     bash "$work/socks5" _generate "$port" "$USERS_FILE" > "$work/config"
-    install -m 755 -- "$1" "$work/gost-routed"
+    install -m 755 -- "$src" "$work/gost-routed"
     # 即使尚未创建正式策略，也先确认二进制实现校验契约。
     printf 'ingress\n' > "$work/probe"
     bash "$work/socks5" _route_check "$work/gost-routed" "$work/probe"
