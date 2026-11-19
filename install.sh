@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
 # SOCKS5 一键部署脚本
-# https://github.com/3055367319z-eng/socks5-setup
+# https://github.com/ca9oxa0/socks5-setup
 #
 # 用法:
-#   安装:   bash <(curl -fsSL https://raw.githubusercontent.com/3055367319z-eng/socks5-setup/main/install.sh)
+#   安装:   bash <(curl -fsSL https://raw.githubusercontent.com/ca9oxa0/socks5-setup/main/install.sh)
 #   升级:   sudo bash install.sh upgrade /absolute/path/to/gost-routed
 #   卸载:   socks5 uninstall
 #   状态:   socks5 status

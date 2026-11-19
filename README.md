@@ -13,7 +13,7 @@ sudo bash install.sh
 安装过程中可自定义端口、用户名、密码，直接回车则随机生成。也可在任意 Linux VPS 上直接运行：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/3055367319z-eng/socks5-setup/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/ca9oxa0/socks5-setup/main/install.sh)
 ```
 
 ## 📋 功能
