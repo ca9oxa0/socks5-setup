@@ -1,0 +1,28 @@
+diff --git a/cmd/gost/main.go b/cmd/gost/main.go
+index 0f6c3ef..a3e7b3b 100644
+--- a/cmd/gost/main.go
++++ b/cmd/gost/main.go
+@@ -13,6 +13,7 @@ import (
+ 	"sync"
+ 
+ 	"github.com/go-gost/core/logger"
++	socks5 "github.com/go-gost/x/handler/socks/v5"
+ 	xlogger "github.com/go-gost/x/logger"
+ 	"github.com/judwhite/go-svc"
+ )
+@@ -28,6 +29,15 @@ var (
+ )
+ 
+ func init() {
++	if path := os.Getenv("SOCKS5_ROUTE_FILE"); path != "" {
++		if err := socks5.ConfigureSourceRouting(path); err != nil {
++			log.Fatal(err)
++		}
++		if os.Getenv("SOCKS5_ROUTE_CHECK") == "1" {
++			os.Exit(0)
++		}
++	}
++
+ 	args := strings.Join(os.Args[1:], "  ")
+ 
+ 	if strings.Contains(args, " -- ") {

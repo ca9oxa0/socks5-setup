@@ -1,0 +1,493 @@
+diff --git a/config/parsing/service/parse.go b/config/parsing/service/parse.go
+index f9fa73c..ca461f0 100644
+--- a/config/parsing/service/parse.go
++++ b/config/parsing/service/parse.go
+@@ -23,6 +23,7 @@ import (
+ 	bypass_parser "github.com/go-gost/x/config/parsing/bypass"
+ 	hop_parser "github.com/go-gost/x/config/parsing/hop"
+ 	selector_parser "github.com/go-gost/x/config/parsing/selector"
++	socks5 "github.com/go-gost/x/handler/socks/v5"
+ 	tls_util "github.com/go-gost/x/internal/util/tls"
+ 	"github.com/go-gost/x/metadata"
+ 	"github.com/go-gost/x/registry"
+@@ -107,6 +108,11 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
+ 		ignoreChain = mdutil.GetBool(md, parsing.MDKeyIgnoreChain)
+ 	}
+ 
++	if socks5.SourceRoutingEnabled() && (cfg.Handler.Type == "socks5" || cfg.Handler.Type == "socks") &&
++		(cfg.Listener.Type != "tcp" || ppv > 0) {
++		return nil, fmt.Errorf("socks5 source routing requires a TCP listener without PROXY protocol")
++	}
++
+ 	listenOpts := []listener.Option{
+ 		listener.AddrOption(cfg.Addr),
+ 		listener.AutherOption(auther),
+diff --git a/handler/socks/v5/connect.go b/handler/socks/v5/connect.go
+index ad4e0e3..844954e 100644
+--- a/handler/socks/v5/connect.go
++++ b/handler/socks/v5/connect.go
+@@ -12,7 +12,7 @@ import (
+ 	sx "github.com/go-gost/x/internal/util/selector"
+ )
+ 
+-func (h *socks5Handler) handleConnect(ctx context.Context, conn net.Conn, network, address string, log logger.Logger) error {
++func (h *socks5Handler) handleConnect(ctx context.Context, conn net.Conn, network, address string, source *net.TCPAddr, log logger.Logger) error {
+ 	log = log.WithFields(map[string]any{
+ 		"dst": fmt.Sprintf("%s/%s", address, network),
+ 		"cmd": "connect",
+@@ -31,7 +31,13 @@ func (h *socks5Handler) handleConnect(ctx context.Context, conn net.Conn, networ
+ 		ctx = sx.ContextWithHash(ctx, &sx.Hash{Source: address})
+ 	}
+ 
+-	cc, err := h.router.Dial(ctx, network, address)
++	var cc net.Conn
++	var err error
++	if source != nil {
++		cc, err = h.dialRoutedTCP(ctx, address, source)
++	} else {
++		cc, err = h.router.Dial(ctx, network, address)
++	}
+ 	if err != nil {
+ 		resp := gosocks5.NewReply(gosocks5.NetUnreachable, nil)
+ 		log.Trace(resp)
+diff --git a/handler/socks/v5/handler.go b/handler/socks/v5/handler.go
+index 690ad24..5611ab7 100644
+--- a/handler/socks/v5/handler.go
++++ b/handler/socks/v5/handler.go
+@@ -25,7 +25,7 @@ func init() {
+ }
+ 
+ type socks5Handler struct {
+-	selector gosocks5.Selector
++	selector *serverSelector
+ 	router   *chain.Router
+ 	md       metadata
+ 	options  handler.Options
+@@ -51,6 +51,12 @@ func (h *socks5Handler) Init(md md.Metadata) (err error) {
+ 	if h.router == nil {
+ 		h.router = chain.NewRouter(chain.LoggerRouterOption(h.options.Logger))
+ 	}
++	if routePolicy != nil {
++		opts := h.router.Options()
++		if opts.Chain != nil || opts.IfceName != "" || (opts.SockOpts != nil && opts.SockOpts.Mark != 0) {
++			return errors.New("socks5 source routing cannot be combined with a chain, interface, or socket mark")
++		}
++	}
+ 
+ 	h.selector = &serverSelector{
+ 		Authenticator: h.options.Auther,
+@@ -87,7 +93,8 @@ func (h *socks5Handler) Handle(ctx context.Context, conn net.Conn, opts ...handl
+ 		conn.SetReadDeadline(time.Now().Add(h.md.readTimeout))
+ 	}
+ 
+-	sc := gosocks5.ServerConn(conn, h.selector)
++	selector := *h.selector
++	sc := gosocks5.ServerConn(conn, &selector)
+ 	req, err := gosocks5.ReadRequest(sc)
+ 	if err != nil {
+ 		log.Error(err)
+@@ -100,17 +107,31 @@ func (h *socks5Handler) Handle(ctx context.Context, conn net.Conn, opts ...handl
+ 	conn = sc
+ 	conn.SetReadDeadline(time.Time{})
+ 
++	var source *net.TCPAddr
++	if routePolicy != nil {
++		switch req.Cmd {
++		case gosocks5.CmdConnect, gosocks5.CmdUdp:
++			source, err = routePolicy.source(conn.LocalAddr(), &selector)
++			if err != nil {
++				log.Error(err)
++				return gosocks5.NewReply(gosocks5.NotAllowed, nil).Write(conn)
++			}
++		case gosocks5.CmdBind, socks.CmdMuxBind, socks.CmdUDPTun:
++			return gosocks5.NewReply(gosocks5.CmdUnsupported, nil).Write(conn)
++		}
++	}
++
+ 	address := req.Addr.String()
+ 
+ 	switch req.Cmd {
+ 	case gosocks5.CmdConnect:
+-		return h.handleConnect(ctx, conn, "tcp", address, log)
++		return h.handleConnect(ctx, conn, "tcp", address, source, log)
+ 	case gosocks5.CmdBind:
+ 		return h.handleBind(ctx, conn, "tcp", address, log)
+ 	case socks.CmdMuxBind:
+ 		return h.handleMuxBind(ctx, conn, "tcp", address, log)
+ 	case gosocks5.CmdUdp:
+-		return h.handleUDP(ctx, conn, log)
++		return h.handleUDP(ctx, conn, source, log)
+ 	case socks.CmdUDPTun:
+ 		return h.handleUDPTun(ctx, conn, "udp", address, log)
+ 	default:
+diff --git a/handler/socks/v5/selector.go b/handler/socks/v5/selector.go
+index f4b4e86..ee50969 100644
+--- a/handler/socks/v5/selector.go
++++ b/handler/socks/v5/selector.go
+@@ -18,6 +18,8 @@ type serverSelector struct {
+ 	TLSConfig     *tls.Config
+ 	logger        logger.Logger
+ 	noTLS         bool
++	authenticated bool
++	username      string
+ }
+ 
+ func (selector *serverSelector) Methods() []uint8 {
+@@ -65,8 +67,6 @@ func (s *serverSelector) OnSelected(method uint8, conn net.Conn) (string, net.Co
+ 			s.logger.Error(err)
+ 			return "", nil, err
+ 		}
+-		s.logger.Trace(req)
+-
+ 		var id string
+ 		if s.Authenticator != nil {
+ 			var ok bool
+@@ -82,6 +82,8 @@ func (s *serverSelector) OnSelected(method uint8, conn net.Conn) (string, net.Co
+ 
+ 				return "", nil, gosocks5.ErrAuthFailure
+ 			}
++			s.authenticated = true
++			s.username = req.Username
+ 		}
+ 
+ 		resp := gosocks5.NewUserPassResponse(gosocks5.UserPassVer, gosocks5.Succeeded)
+diff --git a/handler/socks/v5/source_route.go b/handler/socks/v5/source_route.go
+new file mode 100644
+index 0000000..0881895
+--- /dev/null
++++ b/handler/socks/v5/source_route.go
+@@ -0,0 +1,158 @@
++package v5
++
++import (
++	"bufio"
++	"context"
++	"errors"
++	"fmt"
++	"net"
++	"net/netip"
++	"os"
++	"strings"
++
++	"github.com/go-gost/core/chain"
++	"github.com/go-gost/core/common/net/dialer"
++)
++
++type sourcePolicy struct {
++	mode  string
++	users map[string]netip.Addr
++}
++
++var routePolicy *sourcePolicy
++
++// SourceRoutingEnabled reports whether the SOCKS5 source policy was loaded.
++func SourceRoutingEnabled() bool { return routePolicy != nil }
++
++// ConfigureSourceRouting is called once, before starting any SOCKS5 service.
++func ConfigureSourceRouting(path string) error {
++	p, err := readSourcePolicy(path)
++	if err != nil {
++		return fmt.Errorf("SOCKS5_ROUTE_FILE: %w", err)
++	}
++	routePolicy = p
++	return nil
++}
++
++func readSourcePolicy(path string) (*sourcePolicy, error) {
++	f, err := os.Open(path)
++	if err != nil {
++		return nil, err
++	}
++	defer f.Close()
++
++	p := &sourcePolicy{users: make(map[string]netip.Addr)}
++	var assigned map[netip.Addr]bool
++	s := bufio.NewScanner(f)
++	for line := 1; s.Scan(); line++ {
++		text := strings.TrimSpace(s.Text())
++		if text == "" || strings.HasPrefix(text, "#") {
++			continue
++		}
++		if p.mode == "" {
++			switch text {
++			case "username", "ingress":
++				p.mode = text
++			default:
++				return nil, fmt.Errorf("line %d: expected username or ingress", line)
++			}
++			continue
++		}
++		if p.mode != "username" {
++			return nil, fmt.Errorf("line %d: ingress takes no records", line)
++		}
++		username, rawIP, ok := strings.Cut(s.Text(), "=")
++		if !ok || username == "" {
++			return nil, fmt.Errorf("line %d: expected username=IP", line)
++		}
++		ip, err := netip.ParseAddr(strings.TrimSpace(rawIP))
++		ip = ip.Unmap()
++		if err != nil || ip.Zone() != "" || !validSource(ip) || (ip.Is6() && ip.IsLinkLocalUnicast()) {
++			return nil, fmt.Errorf("line %d: invalid or scoped source IP", line)
++		}
++		if _, exists := p.users[username]; exists {
++			return nil, fmt.Errorf("line %d: duplicate username", line)
++		}
++		if assigned == nil {
++			assigned, err = assignedSourceIPs()
++			if err != nil {
++				return nil, err
++			}
++		}
++		if !assigned[ip] {
++			return nil, fmt.Errorf("line %d: source IP %s is not assigned locally", line, ip)
++		}
++		p.users[username] = ip
++	}
++	if err := s.Err(); err != nil {
++		return nil, err
++	}
++	if p.mode == "" {
++		return nil, errors.New("expected username or ingress")
++	}
++	return p, nil
++}
++
++func assignedSourceIPs() (map[netip.Addr]bool, error) {
++	addrs, err := net.InterfaceAddrs()
++	if err != nil {
++		return nil, err
++	}
++	assigned := make(map[netip.Addr]bool, len(addrs))
++	for _, addr := range addrs {
++		if prefix, err := netip.ParsePrefix(addr.String()); err == nil {
++			assigned[prefix.Addr().Unmap()] = true
++		}
++	}
++	return assigned, nil
++}
++
++func validSource(ip netip.Addr) bool {
++	return ip.IsValid() && !ip.IsUnspecified() && !ip.IsMulticast() && ip.String() != "255.255.255.255"
++}
++
++func (p *sourcePolicy) source(local net.Addr, s *serverSelector) (*net.TCPAddr, error) {
++	if !s.authenticated {
++		return nil, errors.New("socks5 source routing: authentication required")
++	}
++	localTCP, ok := local.(*net.TCPAddr)
++	if !ok {
++		return nil, errors.New("socks5 source routing: a TCP listener is required")
++	}
++	ip := localTCP.AddrPort().Addr().Unmap()
++	if p.mode == "username" {
++		ip, ok = p.users[s.username]
++		if !ok {
++			return nil, errors.New("socks5 source routing: no mapping for authenticated username")
++		}
++	}
++	if !validSource(ip) {
++		return nil, errors.New("socks5 source routing: invalid source IP")
++	}
++	assigned, err := assignedSourceIPs()
++	if err != nil {
++		return nil, err
++	}
++	if !assigned[ip.WithZone("")] {
++		return nil, errors.New("socks5 source routing: source IP is not assigned locally")
++	}
++	return &net.TCPAddr{IP: ip.AsSlice(), Zone: ip.Zone()}, nil
++}
++
++func (h *socks5Handler) dialRoutedTCP(ctx context.Context, address string, source *net.TCPAddr) (net.Conn, error) {
++	opts := h.router.Options()
++	address, err := chain.Resolve(ctx, "ip", address, opts.Resolver, opts.HostMapper, opts.Logger)
++	if err != nil {
++		return nil, err
++	}
++	timeout := opts.Timeout
++	if timeout <= 0 {
++		timeout = dialer.DefaultTimeout
++	}
++	d := net.Dialer{LocalAddr: source, Timeout: timeout}
++	network := "tcp6"
++	if source.IP.To4() != nil {
++		network = "tcp4"
++	}
++	return d.DialContext(ctx, network, address)
++}
+diff --git a/handler/socks/v5/udp.go b/handler/socks/v5/udp.go
+index 1a4506c..f59fd4f 100644
+--- a/handler/socks/v5/udp.go
++++ b/handler/socks/v5/udp.go
+@@ -14,7 +14,7 @@ import (
+ 	"github.com/go-gost/x/internal/util/socks"
+ )
+ 
+-func (h *socks5Handler) handleUDP(ctx context.Context, conn net.Conn, log logger.Logger) error {
++func (h *socks5Handler) handleUDP(ctx context.Context, conn net.Conn, source *net.TCPAddr, log logger.Logger) error {
+ 	log = log.WithFields(map[string]any{
+ 		"cmd": "udp",
+ 	})
+@@ -26,7 +26,12 @@ func (h *socks5Handler) handleUDP(ctx context.Context, conn net.Conn, log logger
+ 		return reply.Write(conn)
+ 	}
+ 
+-	cc, err := net.ListenUDP("udp", nil)
++	var relayAddr *net.UDPAddr
++	if source != nil {
++		local := conn.LocalAddr().(*net.TCPAddr)
++		relayAddr = &net.UDPAddr{IP: local.IP, Zone: local.Zone}
++	}
++	cc, err := net.ListenUDP("udp", relayAddr)
+ 	if err != nil {
+ 		log.Error(err)
+ 		reply := gosocks5.NewReply(gosocks5.Failure, nil)
+@@ -36,10 +41,34 @@ func (h *socks5Handler) handleUDP(ctx context.Context, conn net.Conn, log logger
+ 	}
+ 	defer cc.Close()
+ 
++	var egress net.Conn
++	var client net.PacketConn = cc
++	if source != nil {
++		peer, ok := conn.RemoteAddr().(*net.TCPAddr)
++		if !ok {
++			return gosocks5.NewReply(gosocks5.NotAllowed, nil).Write(conn)
++		}
++		client = &routedUDPClient{UDPConn: cc, peer: peer.IP}
++		network := "udp6"
++		if source.IP.To4() != nil {
++			network = "udp4"
++		}
++		c, err := net.ListenUDP(network, &net.UDPAddr{IP: source.IP, Zone: source.Zone})
++		if err != nil {
++			log.Error(err)
++			return gosocks5.NewReply(gosocks5.Failure, nil).Write(conn)
++		}
++		egress = c
++		defer egress.Close()
++	}
++
+ 	saddr := gosocks5.Addr{}
+ 	saddr.ParseFrom(cc.LocalAddr().String())
+ 	saddr.Type = 0
+ 	saddr.Host, _, _ = net.SplitHostPort(conn.LocalAddr().String()) // replace the IP to the out-going interface's
++	if relayAddr != nil {
++		saddr.Host = relayAddr.IP.String()
++	}
+ 	reply := gosocks5.NewReply(gosocks5.Succeeded, &saddr)
+ 	log.Trace(reply)
+ 	if err := reply.Write(conn); err != nil {
+@@ -52,22 +81,23 @@ func (h *socks5Handler) handleUDP(ctx context.Context, conn net.Conn, log logger
+ 	})
+ 	log.Debugf("bind on %s OK", cc.LocalAddr())
+ 
+-	// obtain a udp connection
+-	c, err := h.router.Dial(ctx, "udp", "") // UDP association
+-	if err != nil {
+-		log.Error(err)
+-		return err
++	if egress == nil {
++		egress, err = h.router.Dial(ctx, "udp", "") // UDP association
++		if err != nil {
++			log.Error(err)
++			return err
++		}
++		defer egress.Close()
+ 	}
+-	defer c.Close()
+ 
+-	pc, ok := c.(net.PacketConn)
++	pc, ok := egress.(net.PacketConn)
+ 	if !ok {
+ 		err := errors.New("socks5: wrong connection type")
+ 		log.Error(err)
+ 		return err
+ 	}
+ 
+-	r := udp.NewRelay(socks.UDPConn(cc, h.md.udpBufferSize), pc).
++	r := udp.NewRelay(socks.UDPConn(client, h.md.udpBufferSize), pc).
+ 		WithBypass(h.options.Bypass).
+ 		WithLogger(log)
+ 	r.SetBufferSize(h.md.udpBufferSize)
+@@ -82,3 +112,24 @@ func (h *socks5Handler) handleUDP(ctx context.Context, conn net.Conn, log logger
+ 
+ 	return nil
+ }
++
++// Only the TCP peer may claim the routed UDP association; pin its port too.
++type routedUDPClient struct {
++	*net.UDPConn
++	peer net.IP
++	port int
++}
++
++func (c *routedUDPClient) ReadFrom(b []byte) (int, net.Addr, error) {
++	for {
++		n, addr, err := c.ReadFromUDP(b)
++		if err != nil {
++			return 0, nil, err
++		}
++		if !addr.IP.Equal(c.peer) || (c.port != 0 && addr.Port != c.port) {
++			continue
++		}
++		c.port = addr.Port
++		return n, addr, nil
++	}
++}
+diff --git a/internal/util/socks/conn.go b/internal/util/socks/conn.go
+index 205b585..ed28a26 100644
+--- a/internal/util/socks/conn.go
++++ b/internal/util/socks/conn.go
+@@ -3,6 +3,7 @@ package socks
+ import (
+ 	"bytes"
+ 	"net"
++	"sync"
+ 
+ 	"github.com/go-gost/core/common/bufpool"
+ 	"github.com/go-gost/gosocks5"
+@@ -91,6 +92,7 @@ var (
+ 
+ type udpConn struct {
+ 	net.PacketConn
++	mu         sync.RWMutex
+ 	raddr      net.Addr
+ 	taddr      net.Addr
+ 	bufferSize int
+@@ -110,7 +112,8 @@ func (c *udpConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
+ 	rbuf := bufpool.Get(c.bufferSize)
+ 	defer bufpool.Put(rbuf)
+ 
+-	n, c.raddr, err = c.PacketConn.ReadFrom(rbuf)
++	var client net.Addr
++	n, client, err = c.PacketConn.ReadFrom(rbuf)
+ 	if err != nil {
+ 		return
+ 	}
+@@ -119,6 +122,9 @@ func (c *udpConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
+ 	header := gosocks5.UDPHeader{
+ 		Addr: &socksAddr,
+ 	}
++	c.mu.Lock()
++	c.raddr = client
++	c.mu.Unlock()
+ 	hlen, err := header.ReadFrom(bytes.NewReader(rbuf[:n]))
+ 	if err != nil {
+ 		return
+@@ -157,7 +163,7 @@ func (c *udpConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
+ 		return
+ 	}
+ 
+-	_, err = c.PacketConn.WriteTo(buf.Bytes(), c.raddr)
++	_, err = c.PacketConn.WriteTo(buf.Bytes(), c.RemoteAddr())
+ 	n = len(b)
+ 
+ 	return
+@@ -168,5 +174,7 @@ func (c *udpConn) Write(b []byte) (n int, err error) {
+ }
+ 
+ func (c *udpConn) RemoteAddr() net.Addr {
++	c.mu.RLock()
++	defer c.mu.RUnlock()
+ 	return c.raddr
+ }

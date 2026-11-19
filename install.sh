@@ -5,6 +5,7 @@
 #
 # 用法:
 #   安装:   bash <(curl -fsSL https://raw.githubusercontent.com/Xjajwjjsjs/socks5-setup/main/install.sh)
+#   升级:   sudo bash install.sh upgrade /absolute/path/to/gost-routed
 #   卸载:   socks5 uninstall
 #   状态:   socks5 status
 #   添加用户: socks5 add
@@ -31,6 +32,7 @@ USERS_FILE="${CONFIG_DIR}/users.txt"
 SERVICE_NAME="socks5-proxy"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 GOST_BIN="${INSTALL_DIR}/gost"
+ROUTED_BIN="${INSTALL_DIR}/gost-routed"
 SOCKS5_CMD="${INSTALL_DIR}/socks5"
 GOST_VERSION="3.0.0-rc10"
 GOST_REPO="https://github.com/go-gost/gost/releases/download/v${GOST_VERSION}"
@@ -184,73 +186,130 @@ remove_firewall_rule() {
     fi
 }
 
-# ============ 生成配置 ============
-generate_config() {
-    local port="$1"
-
-    cat > "$CONFIG_FILE" <<YAML
-services:
-- name: socks5-service
-  addr: ":${port}"
-  handler:
-    type: socks5
-    auths:
-$(while IFS=: read -r user pass; do
-    [[ -z "$user" ]] && continue
-    echo "    - username: \"${user}\""
-    echo "      password: \"${pass}\""
-done < "$USERS_FILE")
-  listener:
-    type: tcp
-YAML
-}
-
 # ============ systemd 服务 ============
-create_service() {
-    cat > "$SERVICE_FILE" <<EOF
+write_service() {
+    cat > "$1" <<EOF
 [Unit]
 Description=SOCKS5 Proxy Service (gost)
-After=network.target
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${GOST_BIN} -C ${CONFIG_FILE}
+ExecStart=${SOCKS5_CMD} _serve
 Restart=always
+RestartPreventExitStatus=78
 RestartSec=5
 LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    systemctl daemon-reload
-    systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1
-    systemctl restart "${SERVICE_NAME}"
-    msg "服务已启动并设置开机自启"
 }
 
-# ============ 管理命令 ============
-create_socks5_cmd() {
-    cat > "$SOCKS5_CMD" <<'SCRIPT'
+# ============ 管理命令与服务入口 ============
+write_socks5_cmd() {
+    cat > "$1" <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
 
 CONFIG_DIR="/etc/socks5"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 USERS_FILE="${CONFIG_DIR}/users.txt"
+ROUTE_FILE="${CONFIG_DIR}/routes.conf"
 SERVICE_NAME="socks5-proxy"
 GOST_BIN="/usr/local/bin/gost"
+ROUTED_BIN="/usr/local/bin/gost-routed"
+umask 077
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 msg()  { echo -e "${GREEN}[✓]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 err()  { echo -e "${RED}[✗]${NC} $*"; exit 1; }
 info() { echo -e "${CYAN}[i]${NC} $*"; }
+# 文字进度条只反映真实阶段，不做计时动画。
+step() {
+    local n="$1" total="$2" label="$3" bar="" i
+    for ((i=1; i<=total; i++)); do
+        if (( i <= n )); then bar+='='; else bar+='-'; fi
+    done
+    info "[${bar}] ${n}/${total} ${label}"
+}
 
 [[ $EUID -eq 0 ]] || err "请使用 root 权限运行"
 
-get_port() { grep -oP 'addr:\s*"?:(\d+)"?' "$CONFIG_FILE" | tr -dc '0-9'; }
+get_port() { sed -nE 's/^[[:space:]]*(# )?addr:[[:space:]]*"?:([0-9]+)"?[[:space:]]*$/\2/p' "$CONFIG_FILE"; }
+valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+
+# JSON 风格双引号是合法的 YAML 字符串，必须逐字转义凭据。
+yaml_string() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\xc2\x85'/\\u0085}
+    value=${value//$'\xe2\x80\xa8'/\\u2028}
+    value=${value//$'\xe2\x80\xa9'/\\u2029}
+    printf '"%s"' "$value"
+}
+
+valid_user() {
+    local LC_ALL=C
+    [[ -n "$1" && -n "$2" && "$1" != *:* && "$1$2" != *[[:cntrl:]]* && ${#1} -le 255 && ${#2} -le 255 ]]
+}
+
+generate_config() {
+    local port="$1" line user pass
+    valid_port "$port" || err "配置中的端口无效"
+    [[ -f "$2" && -r "$2" ]] || err "找不到或无法读取 users.txt"
+    if ! awk -F: 'length($0) && seen["u" $1]++ { exit 1 }' "$2"; then
+        err "users.txt 中存在重复用户名或无法读取"
+    fi
+    if ! grep -q '.' "$2"; then
+        # 空用户配置即使绕过服务入口也不包含任何监听器。
+        printf '# addr: ":%s"\nservices: []\n' "$port"
+        return
+    fi
+    cat <<YAML
+services:
+- name: socks5-service
+  addr: ":${port}"
+  handler:
+    type: socks5
+    auther: socks5-users
+  listener:
+    type: tcp
+
+authers:
+- name: socks5-users
+  auths:
+YAML
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" ]] && continue
+        user=${line%%:*}
+        pass=${line#*:}
+        if [[ "$line" != *:* ]] || ! valid_user "$user" "$pass"; then
+            err "users.txt 中存在无效凭据"
+        fi
+        printf '  - username: %s\n    password: %s\n' "$(yaml_string "$user")" "$(yaml_string "$pass")"
+    done < "$2"
+}
+
+has_users() { [[ -s "$USERS_FILE" ]] && LC_ALL=C grep -q '^.\+:.' "$USERS_FILE"; }
+
+has_policy() { [[ -e "$ROUTE_FILE" || -L "$ROUTE_FILE" ]]; }
+
+check_route() {
+    local bin="$1" route="${2:-$ROUTE_FILE}" output
+    [[ -e "$route" || -L "$route" ]] || return 0
+    [[ -f "$route" && -r "$route" ]] || err "无法读取路由文件 ${route}"
+    [[ -x "$bin" ]] || err "已配置路由，请先通过 install.sh upgrade 安装自定义 GOST"
+    # 使用 -V 防止误启动原版二进制；自定义版校验成功后先于 -V 退出。
+    if ! output=$(SOCKS5_ROUTE_CHECK=1 SOCKS5_ROUTE_FILE="$route" "$bin" -V 2>&1); then
+        [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+        err "路由文件校验失败"
+    fi
+    [[ -z "$output" ]] || err "此 GOST 不支持路由文件校验，请使用构建脚本生成的二进制"
+}
 
 get_public_ip() {
     local ip=""
@@ -262,25 +321,64 @@ get_public_ip() {
 }
 
 rand_str() { head -c 256 /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c "${1:-8}" || true; }
-regenerate_config() {
-    local port
-    port="$(get_port)"
-    cat > "$CONFIG_FILE" <<YAML
-services:
-- name: socks5-service
-  addr: ":${port}"
-  handler:
-    type: socks5
-    auths:
-$(while IFS=: read -r user pass; do
-    [[ -z "$user" ]] && continue
-    echo "    - username: \"${user}\""
-    echo "      password: \"${pass}\""
-done < "$USERS_FILE")
-  listener:
-    type: tcp
-YAML
-    systemctl restart "$SERVICE_NAME"
+check_service() {
+    check_auth_config
+    check_route "$ROUTED_BIN"
+}
+
+check_auth_config() {
+    local expected
+    # GOST 可将空认证表视作未启用认证；此时不启动任何监听器。
+    has_users || { warn "没有有效用户，拒绝启动"; exit 78; }
+    expected=$(generate_config "$(get_port)" "$USERS_FILE") || exit 78
+    printf '%s\n' "$expected" | cmp -s - "$CONFIG_FILE" || err "认证配置与 users.txt 不一致"
+}
+
+start_service() {
+    local verb="$1" port pid attempt listeners
+    port=$(get_port)
+    valid_port "$port" || return 1
+    systemctl "$verb" "$SERVICE_NAME" || return 1
+    # Type=simple 在 GOST 绑定端口前可能已经返回成功。
+    for ((attempt=0; attempt<30; attempt++)); do
+        systemctl is-active --quiet "$SERVICE_NAME" || return 1
+        pid=$(systemctl show -p MainPID "$SERVICE_NAME") || return 1
+        pid=${pid#MainPID=}
+        listeners=$(ss -H -ltnp "sport = :$port") || return 1
+        if [[ "$pid" =~ ^[1-9][0-9]*$ && "$listeners" == *"pid=$pid,"* ]]; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+update_users() {
+    local work="$1" was_active=0 empty=0
+    generate_config "$(get_port)" "$work/users" > "$work/config"
+    if grep -Fxq 'services: []' "$work/config"; then
+        empty=1
+    else
+        check_route "$ROUTED_BIN"
+    fi
+    if systemctl is-active --quiet "$SERVICE_NAME"; then was_active=1; fi
+    cp -p -- "$USERS_FILE" "$work/old-users"
+    cp -p -- "$CONFIG_FILE" "$work/old-config"
+    if (( empty )); then
+        systemctl stop "$SERVICE_NAME"
+    fi
+    if mv -f -- "$work/users" "$USERS_FILE" && mv -f -- "$work/config" "$CONFIG_FILE" &&
+        { (( empty )) || start_service restart; }; then
+        if (( empty )); then warn "已无用户，服务已停止"; fi
+        return 0
+    fi
+
+    warn "更改未能应用，正在恢复用户和配置"
+    systemctl stop "$SERVICE_NAME" || true
+    mv -f -- "$work/old-users" "$USERS_FILE"
+    mv -f -- "$work/old-config" "$CONFIG_FILE"
+    if (( was_active )); then start_service start || warn "无法恢复服务，请检查路由文件和服务日志"; fi
+    err "更新用户失败"
 }
 
 show_info() {
@@ -303,12 +401,494 @@ show_info() {
     echo ""
 }
 
+config_lock() {
+    exec 9>>"$CONFIG_DIR/.lock"
+    flock -x 9
+}
+
+confirm_action() {
+    local answer
+    while IFS= read -rp "确认$1? (y/N): " answer; do
+        case "${answer,,}" in
+            y|yes) return 0 ;;
+            ''|n|no) break ;;
+            *) warn "请输入 y 或 n" ;;
+        esac
+    done
+    info "已取消"
+    return 1
+}
+
+read_users() {
+    local line
+    users=()
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == ?*:* ]] && users+=("${line%%:*}")
+    done < "$1"
+}
+
+print_users() {
+    local i
+    info "当前用户列表:"
+    for i in "${!users[@]}"; do printf '  %d) %s\n' "$((i+1))" "${users[i]}"; done
+    if (( ${#users[@]} == 0 )); then warn "没有用户"; fi
+}
+
+add_user() {
+    local menu="${1:-}" new_user new_pass line port ip work
+    while :; do
+        IFS= read -rp "用户名 (回车随机): " new_user || return 0
+        if [[ -z "$new_user" ]]; then new_user="user_$(rand_str 4)"; fi
+        IFS= read -rsp "密码 (回车随机): " new_pass || { if [[ -t 0 ]]; then printf '\n'; fi; return 0; }
+        if [[ -t 0 ]]; then printf '\n'; fi
+        if [[ -z "$new_pass" ]]; then new_pass="$(rand_str 12)"; fi
+        if valid_user "$new_user" "$new_pass"; then break; fi
+        if [[ "$menu" != menu ]]; then err "凭据无效：用户名不能包含冒号，凭据不能含控制字符或超过 255 字节"; fi
+        warn "凭据无效：用户名不能包含冒号，凭据不能含控制字符或超过 255 字节"
+    done
+    if [[ "$menu" == menu ]]; then
+        printf '将添加用户: %s\n' "$new_user"
+        confirm_action "添加用户" || return 0
+        step 1 2 "获取配置锁并准备用户配置"
+    fi
+    config_lock
+    work=$(mktemp -d "$CONFIG_DIR/.users.XXXXXX")
+    trap 'rm -rf -- "$work"' EXIT
+    { while IFS= read -r line || [[ -n "$line" ]]; do printf '%s\n' "$line"; done < "$USERS_FILE"
+      printf '%s:%s\n' "$new_user" "$new_pass"; } > "$work/users"
+    if [[ "$menu" == menu ]]; then step 2 2 "应用配置并验证服务"; fi
+    update_users "$work"
+    port="$(get_port)"
+    exec 9>&-
+    msg "用户已添加"
+    if [[ "$menu" != menu ]]; then
+        ip="$(get_public_ip)"
+        printf '  %b%s%b\n' "$GREEN" "socks5://${new_user}:${new_pass}@${ip}:${port}" "$NC"
+    fi
+    # EXIT trap 不能引用已经离开作用域的局部变量。
+    rm -rf -- "$work"
+    trap - EXIT
+}
+
+delete_user() {
+    local menu="${1:-}" del_user choice before work line found=0
+    local -a users=()
+    if [[ "$menu" == menu ]]; then
+        config_lock
+        before=$(sha256sum -- "$USERS_FILE")
+        read_users "$USERS_FILE"
+        exec 9>&-
+    else
+        read_users "$USERS_FILE"
+    fi
+    print_users
+    if (( ${#users[@]} == 0 )); then return 0; fi
+    if [[ "$menu" == menu ]]; then
+        while :; do
+            IFS= read -rp "选择用户编号 (0 返回): " choice || return 0
+            [[ "$choice" != 0 ]] || return 0
+            if [[ "$choice" =~ ^[1-9][0-9]{0,8}$ ]] && (( choice <= ${#users[@]} )); then break; fi
+            warn "无效的用户编号"
+        done
+        del_user=${users[choice-1]}
+        printf '将删除用户: %s\n' "$del_user"
+        if (( ${#users[@]} == 1 )); then warn "这是最后一个用户，删除后服务将停止"; fi
+        confirm_action "删除用户" || return 0
+        step 1 2 "获取配置锁并检查用户列表"
+    else
+        IFS= read -rp "输入要删除的用户名: " del_user || return 0
+        [[ -n "$del_user" ]] || err "请输入用户名"
+    fi
+    config_lock
+    if [[ "$menu" == menu ]]; then
+        [[ "$(sha256sum -- "$USERS_FILE")" == "$before" ]] || err "用户列表已变化，请重新选择"
+    fi
+    work=$(mktemp -d "$CONFIG_DIR/.users.XXXXXX")
+    trap 'rm -rf -- "$work"' EXIT
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "${line%%:*}" == "$del_user" ]]; then found=1; else printf '%s\n' "$line"; fi
+    done < "$USERS_FILE" > "$work/users"
+    (( found )) || err "用户名不存在"
+    if [[ "$menu" == menu ]]; then step 2 2 "应用配置并验证服务"; fi
+    update_users "$work"
+    printf '用户 %s 已删除\n' "$del_user"
+    rm -rf -- "$work"
+    trap - EXIT
+}
+
+menu_action() {
+    case "$1" in
+        add) add_user menu ;;
+        del) delete_user menu ;;
+        users) local -a users=(); read_users "$USERS_FILE"; print_users ;;
+        start|stop|restart)
+            local verb="$1" label
+            case "$verb" in start) label=启动服务 ;; stop) label=停止服务 ;; restart) label=重启服务 ;; esac
+            confirm_action "$label" || return 0
+            step 1 2 "执行${label}"
+            bash "${BASH_SOURCE[0]}" "$verb" || return 1
+            step 2 2 "操作完成"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# 当前策略的首个有效行；文件不存在表示系统默认选路。
+route_mode() {
+    if has_policy; then
+        awk 'NF && $1 !~ /^#/ { print $1; exit }' "$ROUTE_FILE" 2>/dev/null
+    else
+        echo default
+    fi
+}
+
+route_show() {
+    local mode
+    mode=$(route_mode)
+    case "$mode" in
+        ingress)
+            info "当前策略：按接入 IP 绑定出口（ingress）"
+            ;;
+        username)
+            info "当前策略：按用户名绑定出口（username）"
+            local line
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                [[ -z "$line" || "${line:0:1}" == "#" || "$line" == username ]] && continue
+                printf '  %s\n' "$line"
+            done < "$ROUTE_FILE"
+            ;;
+        default) info "当前策略：系统默认选路（未绑定出口）" ;;
+        *) warn "当前策略文件格式未知：${mode:-空}" ;;
+    esac
+    if [[ "$mode" != default ]]; then
+        warn "策略需要自定义 GOST；未映射用户或绑定失败时请求会被拒绝"
+    fi
+}
+
+route_stamp() {
+    if has_policy; then sha256sum -- "$ROUTE_FILE"; else echo absent; fi
+}
+
+# 事务在子 shell 中执行：失败只影响本次操作，不退出菜单。
+# 返回 2 表示用户取消，其余非零为失败。
+route_apply() (
+    local mode="$1" policy="$2" work old existed=0 active=0 line
+    work=$(mktemp -d "$CONFIG_DIR/.route.XXXXXX") || { warn "无法创建临时目录"; exit 1; }
+    trap 'rm -rf -- "$work"' EXIT
+    printf '%s' "$policy" > "$work/routes"
+    chmod 600 "$work/routes"
+    if has_policy; then cp -p -- "$ROUTE_FILE" "$work/old"; existed=1; fi
+
+    step 1 4 "校验出口策略"
+    if [[ "$mode" != default ]]; then
+        check_route "$ROUTED_BIN" "$work/routes"
+    fi
+
+    printf '\n策略预览（%s）：\n' "$mode"
+    while IFS= read -r line || [[ -n "$line" ]]; do printf '  %s\n' "$line"; done < "$work/routes"
+    if [[ "$mode" == username ]]; then
+        warn "策略中未列出的用户将无法转发"
+    fi
+    confirm_action "应用出口策略" || exit 2
+
+    step 2 4 "获取配置锁并确认配置未变化"
+    local users_before route_before
+    users_before=$(sha256sum -- "$USERS_FILE")
+    route_before=$(route_stamp)
+    config_lock
+    [[ "$(sha256sum -- "$USERS_FILE")" == "$users_before" && "$(route_stamp)" == "$route_before" ]] ||
+        err "用户或策略已被修改，请重新选择"
+
+    step 3 4 "备份并应用策略"
+    if [[ "$mode" == default ]]; then
+        rm -f -- "$ROUTE_FILE"
+    else
+        mv -fT -- "$work/routes" "$ROUTE_FILE"
+        check_route "$ROUTED_BIN" "$ROUTE_FILE"
+    fi
+
+    systemctl is-active --quiet "$SERVICE_NAME" && active=1
+    if (( active )); then
+        step 4 4 "重启服务并确认端口监听"
+        if ! start_service restart; then
+            warn "应用后服务未能监听，正在恢复原策略"
+            if (( existed )); then
+                mv -fT -- "$work/old" "$ROUTE_FILE"
+            else
+                rm -f -- "$ROUTE_FILE"
+            fi
+            if ! start_service restart; then
+                trap - EXIT
+                err "回滚后服务仍无法启动；原策略保留在 $work，请查看 journalctl -u $SERVICE_NAME"
+            fi
+            err "策略未生效，已恢复原策略和服务状态"
+        fi
+    else
+        info "服务当前未运行，策略已保存；启动服务后生效"
+    fi
+    trap - EXIT
+    rm -rf -- "$work"
+    msg "出口策略已应用"
+)
+
+route_menu() {
+    local choice action mode ip user rc=0
+    local -a users=()
+    while :; do
+        printf '\n出口配置\n'
+        route_show
+        printf '%s\n' '  1) 系统默认   2) 按接入 IP   3) 按用户名' \
+            '  4) 查看当前   0) 返回'
+        IFS= read -rp "请选择 [0-4]: " choice || return 0
+        action="$choice"
+        case "$choice" in
+            0) return 0 ;;
+            4) continue ;;
+            1)
+                if route_apply default ""; then continue; else rc=$?; fi
+                ;;
+            2)
+                if route_apply ingress $'ingress\n'; then continue; else rc=$?; fi
+                ;;
+            3)
+                read_users "$USERS_FILE"
+                local -a lines=()
+                for user in "${users[@]}"; do
+                    while :; do
+                        IFS= read -rp "${user} 的出口 IP (回车跳过该用户): " ip || return 0
+                        ip=${ip//[[:space:]]/}
+                        [[ -n "$ip" ]] || break
+                        if [[ "$ip" == *[=\#]* ]]; then
+                            warn "IP 不能包含 = 或 #，请重新输入"
+                            continue
+                        fi
+                        lines+=("${user}=${ip}")
+                        break
+                    done
+                done
+                if (( ${#lines[@]} == 0 )); then
+                    warn "未填写任何映射，请重新选择"
+                    continue
+                fi
+                mode=$'username\n'
+                for ip in "${lines[@]}"; do mode+="${ip}"$'\n'; done
+                if route_apply username "$mode"; then continue; else rc=$?; fi
+                ;;
+            *) warn "无效的选项"; continue ;;
+        esac
+        (( rc == 2 )) && continue
+        printf '%s\n' '  1) 重试  0) 返回'
+        IFS= read -rp "请选择 [0-1]: " choice || return 0
+        [[ "$choice" == 1 ]] || continue
+        case "$action" in
+            1) route_apply default "" || true ;;
+            2) route_apply ingress $'ingress\n' || true ;;
+            3) route_apply username "$mode" || true ;;
+        esac
+    done
+}
+
+# 每次操作由独立脚本进程执行，菜单中的条件判断不会禁用子进程的 errexit。
+menu_run() {
+    local retry rc
+    while :; do
+        if bash "${BASH_SOURCE[0]}" "$@"; then return 0; else rc=$?; fi
+        if [[ "$1" == status && "$rc" == 3 ]]; then return 0; fi
+        warn "操作失败 (退出状态 $rc)"
+        printf '  1) 重试  0) 返回\n'
+        while IFS= read -rp "请选择 [0-1]: " retry; do
+            case "$retry" in
+                1) break ;;
+                ''|0) return 0 ;;
+                *) warn "无效的选项" ;;
+            esac
+        done
+        [[ "$retry" == 1 ]] || return 0
+    done
+}
+
+# 查看服务日志；journalctl 不可用时给出明确提示，不退出菜单。
+logs_menu() {
+    local choice lines
+    while :; do
+        printf '\n查看日志\n%s\n' '  1) 最近 50 行   2) 最近 200 行   0) 返回'
+        IFS= read -rp "请选择 [0-2]: " choice || return 0
+        case "$choice" in
+            0) return 0 ;;
+            1) lines=50 ;;
+            2) lines=200 ;;
+            *) warn "无效的选项"; continue ;;
+        esac
+        info "最近 ${lines} 行日志："
+        journalctl -u "$SERVICE_NAME" -n "$lines" --no-pager -o cat || warn "无法读取日志，请确认 journalctl 可用"
+    done
+}
+
+open_port() {
+    local port="$1"
+    if command -v ufw >/dev/null 2>&1; then ufw allow "$port"/tcp >/dev/null 2>&1 || true; fi
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null ||
+            iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+    fi
+}
+
+# 事务在子 shell 中执行，失败不会退出菜单；返回 2 表示取消。
+port_apply() (
+    local current cur new work active=0 users_before port_before
+    current=$(get_port)
+    cur=${current:-0}
+    info "当前端口：${current:-未知}"
+    while :; do
+        IFS= read -rp "新端口 (1-65535，回车取消): " new || exit 2
+        [[ -n "$new" ]] || exit 2
+        if ! valid_port "$new"; then warn "端口必须是 1-65535 的数字"; continue; fi
+        new=$((10#$new))
+        if (( new == 10#$cur )); then info "端口未变化"; exit 2; fi
+        break
+    done
+    if ss -H -ltn "sport = :$new" 2>/dev/null | grep -q ":${new}[[:space:]]"; then
+        err "端口 ${new} 已被占用，请选择其他端口"
+    fi
+    printf '将把端口从 %s 改为 %s。\n' "$current" "$new"
+    confirm_action "修改端口" || exit 2
+    step 1 4 "生成并校验新配置"
+    work=$(mktemp -d "$CONFIG_DIR/.port.XXXXXX") || err "无法创建临时目录"
+    trap 'rm -rf -- "$work"' EXIT
+    bash "${BASH_SOURCE[0]}" _generate "$new" "$USERS_FILE" > "$work/config" || err "生成配置失败"
+    step 2 4 "获取配置锁并确认配置未变化"
+    users_before=$(sha256sum -- "$USERS_FILE")
+    port_before=$(get_port)
+    config_lock
+    [[ "$(sha256sum -- "$USERS_FILE")" == "$users_before" && "$(get_port)" == "$port_before" ]] ||
+        err "用户或端口已被修改，请重新选择"
+    cp -p -- "$CONFIG_FILE" "$work/old-config"
+    step 3 4 "应用端口并放行防火墙"
+    install -m 600 -- "$work/config" "$CONFIG_FILE"
+    open_port "$new"
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        step 4 4 "重启服务并确认新端口监听"
+        if ! start_service restart; then
+            install -m 600 -- "$work/old-config" "$CONFIG_FILE"
+            if ! start_service restart; then
+                trap - EXIT
+                err "回滚后服务仍无法启动；原配置保留在 $work"
+            fi
+            err "端口修改未生效，已恢复原端口"
+        fi
+    else
+        info "服务当前未运行，端口已保存；启动服务后生效"
+    fi
+    trap - EXIT
+    rm -rf -- "$work"
+    msg "端口已修改为 $new；请同步更新客户端配置"
+)
+
+port_menu() {
+    local rc choice
+    while :; do
+        if port_apply; then return 0; else rc=$?; fi
+        (( rc == 2 )) && return 0
+        printf '  1) 重试  0) 返回\n'
+        IFS= read -rp "请选择 [0-1]: " choice || return 0
+        [[ "$choice" == 1 ]] || return 0
+    done
+}
+
+upgrade_menu() {
+    local installer="$CONFIG_DIR/installer.sh" path choice
+    local version routed_version
+    if [[ ! -r "$installer" ]]; then
+        warn "未找到本地安装脚本；请在源码目录运行 sudo bash install.sh upgrade /绝对路径/gost-routed"
+        return 0
+    fi
+    version=$("$GOST_BIN" -V 2>/dev/null) || version=未知
+    info "当前版本：${version}"
+    if [[ -x "$ROUTED_BIN" ]]; then
+        routed_version=$("$ROUTED_BIN" -V 2>/dev/null) || routed_version=未知
+        info "自定义版本：${routed_version}"
+    fi
+    while :; do
+        IFS= read -rp "升级二进制绝对路径 (回车取消): " path || return 0
+        [[ -n "$path" ]] || return 0
+        if [[ "$path" != /* ]]; then warn "请输入绝对路径"; continue; fi
+        if [[ ! -f "$path" || ! -r "$path" ]]; then warn "文件不存在或不可读"; continue; fi
+        break
+    done
+    printf '将使用 %s 升级，保留端口和用户。\n' "$path"
+    confirm_action "升级 GOST" || return 0
+    while :; do
+        if bash "$installer" upgrade "$path"; then return 0; fi
+        printf '  1) 重试  0) 返回\n'
+        IFS= read -rp "请选择 [0-1]: " choice || return 0
+        [[ "$choice" == 1 ]] || return 0
+    done
+}
+
+show_menu() {
+    local choice active port
+    [[ -t 0 && -t 1 ]] || err "管理菜单需要交互式终端，请使用 socks5 help 查看命令"
+    while :; do
+        active=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null) || true
+        port=$(get_port 2>/dev/null) || true
+        printf '\nSOCKS5 管理菜单  |  服务: %s  |  端口: %s\n' "${active:-未知}" "${port:-未知}"
+        printf '%s\n' '  1) 状态   2) 连接信息   3) 用户列表' \
+            '  4) 启动   5) 停止       6) 重启' \
+            '  7) 添加   8) 删除       9) 出口配置' \
+            ' 10) 查看日志  11) 修改端口  12) 升级' \
+            ' 13) 卸载   0) 退出'
+        IFS= read -rp "请选择 [0-13]: " choice || return 0
+        case "$choice" in
+            0) return 0 ;;
+            1) menu_run status ;;
+            2) menu_run info ;;
+            3) menu_run _menu_action users ;;
+            4) menu_run _menu_action start ;;
+            5) menu_run _menu_action stop ;;
+            6) menu_run _menu_action restart ;;
+            7) menu_run _menu_action add ;;
+            8) menu_run _menu_action del ;;
+            9) route_menu ;;
+            10) logs_menu ;;
+            11) port_menu ;;
+            12) upgrade_menu ;;
+            13) menu_run uninstall; if [[ ! -d "$CONFIG_DIR" ]]; then return 0; fi ;;
+            *) warn "无效的选项" ;;
+        esac
+    done
+}
+
+if (( $# == 0 )) && [[ -t 0 && -t 1 ]]; then set -- menu; fi
 case "${1:-help}" in
+    menu) show_menu ;;
+    _menu_action) menu_action "$2" ;;
+    _generate) generate_config "$2" "$3" ;;
+    _port) get_port ;;
+    _route_check) check_route "$2" "${3:-}" ;;
+    _check) check_service ;;
+    _start) start_service start ;;
+    _restart) start_service restart ;;
+    _serve)
+        ( check_service ) || exit 78
+        unset SOCKS5_ROUTE_CHECK SOCKS5_ROUTE_FILE
+        if has_policy; then
+            export SOCKS5_ROUTE_FILE="$ROUTE_FILE"
+            exec "$ROUTED_BIN" -C "$CONFIG_FILE"
+        fi
+        exec "$GOST_BIN" -C "$CONFIG_FILE"
+        ;;
     status)
         systemctl status "$SERVICE_NAME" --no-pager
         ;;
     restart)
-        systemctl restart "$SERVICE_NAME"
+        exec 9>"$CONFIG_DIR/.lock"
+        flock -x 9
+        check_service
+        start_service restart || err "服务未监听预期端口，请查看服务日志"
         msg "服务已重启"
         ;;
     stop)
@@ -316,7 +896,10 @@ case "${1:-help}" in
         msg "服务已停止"
         ;;
     start)
-        systemctl start "$SERVICE_NAME"
+        exec 9>"$CONFIG_DIR/.lock"
+        flock -x 9
+        check_service
+        start_service start || err "服务未监听预期端口，请查看服务日志"
         msg "服务已启动"
         ;;
     info)
@@ -327,8 +910,14 @@ case "${1:-help}" in
         [[ -z "$new_user" ]] && new_user="user_$(rand_str 4)"
         read -rp "密码 (回车随机): " new_pass
         [[ -z "$new_pass" ]] && new_pass="$(rand_str 12)"
-        echo "${new_user}:${new_pass}" >> "$USERS_FILE"
-        regenerate_config
+        valid_user "$new_user" "$new_pass" || err "凭据无效：用户名不能包含冒号，凭据不能含控制字符或超过 255 字节"
+        exec 9>"$CONFIG_DIR/.lock"
+        flock -x 9
+        work=$(mktemp -d "$CONFIG_DIR/.users.XXXXXX")
+        trap 'rm -rf -- "$work"' EXIT
+        { while IFS= read -r line || [[ -n "$line" ]]; do printf '%s\n' "$line"; done < "$USERS_FILE"
+          printf '%s:%s\n' "$new_user" "$new_pass"; } > "$work/users"
+        update_users "$work"
         _ip="$(get_public_ip)"
         _port="$(get_port)"
         msg "用户已添加"
@@ -349,17 +938,22 @@ case "${1:-help}" in
         done < "$USERS_FILE"
         echo ""
         read -rp "输入要删除的用户名: " del_user
-        if grep -Fq "${del_user}:" "$USERS_FILE" && grep -q "^$(printf '%s' "$del_user" | sed 's/[.[\*^$()+?{|\\]/\\&/g'):" "$USERS_FILE"; then
-            grep -Fxv "$(grep -F "${del_user}:" "$USERS_FILE")" "$USERS_FILE" > "${USERS_FILE}.tmp" || true
-            mv "${USERS_FILE}.tmp" "$USERS_FILE"
-            if [[ ! -s "$USERS_FILE" ]]; then
-                warn "警告: 已无用户，服务将无法认证"
+        [[ -n "$del_user" ]] || err "请输入用户名"
+        exec 9>"$CONFIG_DIR/.lock"
+        flock -x 9
+        work=$(mktemp -d "$CONFIG_DIR/.users.XXXXXX")
+        trap 'rm -rf -- "$work"' EXIT
+        found=0
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "${line%%:*}" == "$del_user" ]]; then
+                found=1
+            else
+                printf '%s\n' "$line"
             fi
-            regenerate_config
-            msg "用户 ${del_user} 已删除"
-        else
-            err "用户 ${del_user} 不存在"
-        fi
+        done < "$USERS_FILE" > "$work/users"
+        (( found )) || err "用户名不存在"
+        update_users "$work"
+        msg "用户 ${del_user} 已删除"
         ;;
     list)
         echo ""
@@ -382,7 +976,7 @@ case "${1:-help}" in
             systemctl disable "$SERVICE_NAME" 2>/dev/null || true
             rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
             systemctl daemon-reload
-            rm -f "$GOST_BIN"
+            rm -f "$GOST_BIN" "$ROUTED_BIN"
             rm -rf "$CONFIG_DIR"
             # 清理防火墙
             if [[ -n "${_port:-}" ]]; then
@@ -405,6 +999,8 @@ case "${1:-help}" in
         echo ""
         echo -e "${BOLD}SOCKS5 管理工具${NC}"
         echo ""
+        echo "  socks5            打开交互菜单（终端）"
+        echo "  socks5 menu       打开交互菜单"
         echo "  socks5 info       查看连接信息"
         echo "  socks5 status     查看服务状态"
         echo "  socks5 start      启动服务"
@@ -418,7 +1014,7 @@ case "${1:-help}" in
         ;;
 esac
 SCRIPT
-    chmod +x "$SOCKS5_CMD"
+    chmod 755 "$1"
 }
 
 # ============ 下载 gost ============
@@ -440,8 +1036,108 @@ download_gost() {
     msg "gost 下载完成"
 }
 
+# ============ 单独更新管理命令 ============
+do_update_cli() (
+    check_root
+    [[ $# -eq 0 ]] || err "用法：sudo bash install.sh update-cli"
+    [[ -d "$CONFIG_DIR" && -x "$SOCKS5_CMD" ]] || err "未找到可更新的 SOCKS5 安装"
+    umask 077
+    exec 9>"$CONFIG_DIR/.lock"
+    flock -x 9
+    [[ -f "$CONFIG_FILE" && -f "$USERS_FILE" && -f "$SERVICE_FILE" ]] &&
+        grep -Fxq "ExecStart=${SOCKS5_CMD} _serve" "$SERVICE_FILE" ||
+        err "当前安装不支持单独更新菜单，请使用原地升级"
+
+    local candidate port
+    candidate=$(mktemp "${SOCKS5_CMD}.update.XXXXXX")
+    trap 'rm -f -- "$candidate"' EXIT
+    write_socks5_cmd "$candidate"
+    bash -n "$candidate" || err "新管理脚本语法检查失败，未替换原文件"
+    port=$(bash "$candidate" _port) || err "无法读取现有端口，未替换原文件"
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) ||
+        err "现有端口无效，未替换原文件"
+    mv -fT -- "$candidate" "$SOCKS5_CMD"
+    msg "管理菜单已更新，未重启服务。运行 sudo socks5 打开菜单。"
+)
+
+# ============ 原地升级 ============
+do_upgrade() (
+    check_root
+    [[ $# -eq 1 && "$1" == /* && -f "$1" && -r "$1" ]] ||
+        err "用法：sudo bash install.sh upgrade /absolute/path/to/gost-routed"
+    [[ -x "$GOST_BIN" && -f "$CONFIG_FILE" && -f "$USERS_FILE" && -f "$SERVICE_FILE" ]] ||
+        err "未找到已有安装，请先运行 bash install.sh"
+
+    umask 077
+    # 兼容旧安装曾以 0644 生成含明文凭据的 YAML。
+    chmod 600 "$USERS_FILE" "$CONFIG_FILE"
+    exec 9>"$CONFIG_DIR/.lock"
+    flock -x 9
+    local work port was_active=0 i path
+    local -a targets=("$ROUTED_BIN" "$SOCKS5_CMD" "$CONFIG_FILE" "$SERVICE_FILE")
+    work=$(mktemp -d "$CONFIG_DIR/.upgrade.XXXXXX")
+    trap 'rm -rf -- "$work"' EXIT
+    write_socks5_cmd "$work/socks5"
+    write_service "$work/service"
+    port=$(bash "$work/socks5" _port)
+    bash "$work/socks5" _generate "$port" "$USERS_FILE" > "$work/config"
+    install -m 755 -- "$1" "$work/gost-routed"
+    # 即使尚未创建正式策略，也先确认二进制实现校验契约。
+    printf 'ingress\n' > "$work/probe"
+    bash "$work/socks5" _route_check "$work/gost-routed" "$work/probe"
+    bash "$work/socks5" _route_check "$work/gost-routed"
+    # 保留安装脚本副本，供管理菜单内的升级使用。
+    if [[ -f "$0" && -r "$0" ]]; then install -m 700 -- "$0" "$CONFIG_DIR/installer.sh" || true; fi
+
+    if systemctl is-active --quiet "$SERVICE_NAME"; then was_active=1; fi
+    for i in "${!targets[@]}"; do
+        path=${targets[i]}
+        if [[ -e "$path" || -L "$path" ]]; then
+            cp -a -- "$path" "$work/old-$i"
+        fi
+    done
+
+    # 先停止服务，避免旧服务在切换过程中重启并载入不完整的配置。
+    systemctl stop "$SERVICE_NAME"
+    if install -m 755 -- "$work/gost-routed" "$ROUTED_BIN" &&
+        install -m 755 -- "$work/socks5" "$SOCKS5_CMD" &&
+        install -m 600 -- "$work/config" "$CONFIG_FILE" &&
+        install -m 644 -- "$work/service" "$SERVICE_FILE" &&
+        systemctl daemon-reload &&
+        { (( ! was_active )) || grep -Fxq 'services: []' "$CONFIG_FILE" || bash "$SOCKS5_CMD" _start; }; then
+        msg "GOST 已升级，保留端口和用户；路由文件由管理员维护"
+        return 0
+    fi
+
+    warn "升级未能应用，正在恢复原安装"
+    systemctl stop "$SERVICE_NAME" || true
+    local restored=1
+    for i in "${!targets[@]}"; do
+        path=${targets[i]}
+        if [[ -e "$work/old-$i" || -L "$work/old-$i" ]]; then
+            mv -f -- "$work/old-$i" "$path" || restored=0
+        else
+            rm -f -- "$path" || restored=0
+        fi
+    done
+    if (( ! restored )); then
+        trap - EXIT
+        err "无法恢复原安装，备份保留在 ${work}"
+    fi
+    systemctl daemon-reload || err "已恢复原文件，但无法重新加载服务配置"
+    if (( was_active )); then
+        # 旧版内联认证或空用户配置不能安全地恢复监听。
+        if cmp -s "$CONFIG_FILE" "$work/config" && ! grep -Fxq 'services: []' "$work/config"; then
+            systemctl start "$SERVICE_NAME" || warn "原服务未能恢复，请检查服务日志"
+        else
+            warn "原配置未通过认证检查，服务保持停止"
+        fi
+    fi
+    err "升级失败"
+)
+
 # ============ 主安装流程 ============
-do_install() {
+do_install() (
     # 修复 bash <(curl ...) 方式运行时 stdin 被占用的问题
     exec < /dev/tty || err "无法连接终端，请在交互式终端中运行此脚本"
 
@@ -457,7 +1153,7 @@ do_install() {
 
     # 检查是否已安装
     if [[ -f "$GOST_BIN" ]] && [[ -f "$CONFIG_FILE" ]]; then
-        warn "检测到已有安装"
+        warn "检测到已有安装；如需保留端口和用户，请使用 install.sh upgrade"
         read -rp "是否重新安装? (y/N): " reinstall
         [[ "${reinstall,,}" != "y" ]] && { info "已取消"; exit 0; }
         systemctl stop "$SERVICE_NAME" 2>/dev/null || true
@@ -471,10 +1167,11 @@ do_install() {
     read -rp "$(echo -e "${CYAN}[?]${NC} 端口 (回车随机 ${default_port}): ")" S5_PORT
     S5_PORT="${S5_PORT:-$default_port}"
 
-    # 验证端口是否为合法数字
-    if ! [[ "$S5_PORT" =~ ^[0-9]+$ ]] || (( S5_PORT < 1 || S5_PORT > 65535 )); then
+    # 验证端口是否为合法十进制数字
+    if ! [[ "$S5_PORT" =~ ^[0-9]{1,5}$ ]] || (( 10#$S5_PORT < 1 || 10#$S5_PORT > 65535 )); then
         err "无效端口: ${S5_PORT}，请输入 1-65535 之间的数字"
     fi
+    S5_PORT=$((10#$S5_PORT))
 
     # 检查端口是否被占用
     if ss -tlnp | grep -q ":${S5_PORT} "; then
@@ -495,27 +1192,32 @@ do_install() {
     echo ""
     info "开始安装..."
 
-    # 下载 gost
+    # 安装和管理命令共用同一个配置生成器。
+    mkdir -p -m 700 "$CONFIG_DIR"
+    umask 077
+    local work
+    work=$(mktemp -d "$CONFIG_DIR/.install.XXXXXX")
+    trap 'rm -rf -- "$work"' EXIT
+    write_socks5_cmd "$work/socks5"
+    printf '%s:%s\n' "$S5_USER" "$S5_PASS" > "$work/users"
+    bash "$work/socks5" _generate "$S5_PORT" "$work/users" > "$work/config"
+    bash "$work/socks5" _route_check "$ROUTED_BIN"
+    write_service "$work/service"
     download_gost
+    install -m 600 -- "$work/users" "$USERS_FILE"
+    install -m 600 -- "$work/config" "$CONFIG_FILE"
+    install -m 755 -- "$work/socks5" "$SOCKS5_CMD"
+    install -m 644 -- "$work/service" "$SERVICE_FILE"
+    # 保留安装脚本副本，供管理菜单内的升级使用。
+    if [[ -f "$0" && -r "$0" ]]; then install -m 700 -- "$0" "$CONFIG_DIR/installer.sh" || true; fi
 
-    # 创建配置目录
-    mkdir -p "$CONFIG_DIR"
-
-    # 保存用户
-    echo "${S5_USER}:${S5_PASS}" > "$USERS_FILE"
-    chmod 600 "$USERS_FILE"
-
-    # 生成配置
-    generate_config "$S5_PORT"
-
-    # 防火墙
     configure_firewall "$S5_PORT"
-
-    # 创建服务
-    create_service
-
-    # 创建管理命令
-    create_socks5_cmd
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+    bash "$SOCKS5_CMD" _restart || { systemctl stop "$SERVICE_NAME" || true; err "服务未监听预期端口，请查看服务日志"; }
+    msg "服务已启动并设置开机自启"
+    rm -rf -- "$work"
+    trap - EXIT
 
     # 获取公网 IP
     local PUBLIC_IP
@@ -536,17 +1238,19 @@ do_install() {
     echo -e "  ${GREEN}${BOLD}socks5://${S5_USER}:${S5_PASS}@${PUBLIC_IP}:${S5_PORT}${NC}"
     echo ""
     echo -e "${BOLD}═══════════════════════════════════════════${NC}"
-    echo -e "  管理命令: ${CYAN}socks5 help${NC}"
+    echo -e "  管理菜单: ${CYAN}socks5${NC}（命令帮助：socks5 help）"
     echo -e "${BOLD}═══════════════════════════════════════════${NC}"
     echo ""
-}
+)
 
 # ============ 入口 ============
 # 如果通过 socks5 命令调用则转发参数
 # 如果直接运行则执行安装
 case "${1:-install}" in
     install) do_install ;;
-    *) 
+    upgrade) shift; do_upgrade "$@" ;;
+    update-cli) shift; do_update_cli "$@" ;;
+    *)
         # 如果存在管理命令则转发
         if [[ -x "$SOCKS5_CMD" ]]; then
             exec "$SOCKS5_CMD" "$@"
