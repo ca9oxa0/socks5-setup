@@ -302,7 +302,7 @@ check_route() {
     local bin="$1" route="${2:-$ROUTE_FILE}" output
     [[ -e "$route" || -L "$route" ]] || return 0
     [[ -f "$route" && -r "$route" ]] || err "无法读取路由文件 ${route}"
-    [[ -x "$bin" ]] || err "已配置路由，请先通过 install.sh upgrade 安装自定义 GOST"
+    [[ -x "$bin" ]] || err "未找到多出口组件 ${bin}；请先运行 sudo bash install.sh upgrade /路径/gost-routed"
     # 使用 -V 防止误启动原版二进制；自定义版校验成功后先于 -V 退出。
     if ! output=$(SOCKS5_ROUTE_CHECK=1 SOCKS5_ROUTE_FILE="$route" "$bin" -V 2>&1); then
         [[ -z "$output" ]] || printf '%s\n' "$output" >&2
@@ -634,6 +634,10 @@ route_apply() (
 route_menu() {
     local choice action mode ip user rc=0
     local -a users=()
+    if [[ ! -x "$ROUTED_BIN" ]]; then
+        warn "未安装多出口组件（${ROUTED_BIN}），出口策略无法生效"
+        warn "安装方法：sudo bash install.sh upgrade /路径/gost-routed"
+    fi
     while :; do
         printf '\n出口配置\n'
         route_show

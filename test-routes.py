@@ -54,7 +54,7 @@ def authenticate(sock, user, password):
 
 
 @contextlib.contextmanager
-def proxy(binary, mode, first, second, family):
+def proxy(binary, mode, first, second, family, policy=None):
     with tempfile.TemporaryDirectory() as directory:
         directory = pathlib.Path(directory)
         with socket.socket(family, socket.SOCK_STREAM) as reservation:
@@ -84,12 +84,12 @@ def proxy(binary, mode, first, second, family):
         for key in ("SOCKS5_ROUTE_CHECK", "SOCKS5_ROUTE_FILE"):
             env.pop(key, None)
         if mode != "default":
-            policy = directory / "routes.conf"
+            policy_file = directory / "routes.conf"
             text = mode + "\n"
             if mode == "username":
                 text += f"alice={first}\nbob={second}\n"
-            policy.write_text(text, encoding="utf-8")
-            env["SOCKS5_ROUTE_FILE"] = str(policy)
+            policy_file.write_text(policy if policy is not None else text, encoding="utf-8")
+            env["SOCKS5_ROUTE_FILE"] = str(policy_file)
         with (directory / "gost.log").open("w+") as log:
             proc = subprocess.Popen([binary, "-C", str(config)], env=env, stdout=log, stderr=log)
             try:
@@ -144,7 +144,7 @@ def observer(family, local_ip, udp=False):
             worker.join()
 
 
-def request(entry, port, user, command, payload, should_fail=False):
+def request(entry, port, user, command, payload, should_fail=False, expect_status=None):
     client = socket.create_connection((entry, port), timeout=5)
     try:
         assert authenticate(client, user, USERS[user]), "有效凭据被拒绝"
@@ -155,6 +155,8 @@ def request(entry, port, user, command, payload, should_fail=False):
             assert status != 0, "不满足出口策略的请求不应成功"
         else:
             assert status == 0, f"SOCKS5 请求失败，状态码 {status}"
+        if expect_status is not None:
+            assert status == expect_status, f"SOCKS5 状态码 {status}，期望 {expect_status}"
         return client, read_address(client, kind)
     except BaseException:
         client.close()
@@ -192,6 +194,7 @@ def check_policy(binary, first, second):
         env = dict(os.environ, SOCKS5_ROUTE_FILE=str(policy), SOCKS5_ROUTE_CHECK="1")
         cases = [
             (f"username\nalice={first}\nbob={second}\n", True),
+            (f"username\n  alice = {first}\n  bob = {second}\n", True),
             ("ingress\n", True),
             (f"username\nalice={first}\nalice={second}\n", False),
             ("username\nalice=not-an-ip\n", False),
@@ -274,9 +277,16 @@ def main():
                 opposite_ip = "::1" if version == 4 else "127.0.0.1"
                 if socket.has_ipv6:
                     with observer(opposite, opposite_ip) as opposite_port:
-                        client, _ = request(a, port, "alice", 1, address(opposite_ip, opposite_port), should_fail=True)
+                        client, _ = request(a, port, "alice", 1, address(opposite_ip, opposite_port),
+                                            should_fail=True, expect_status=8)
                         client.close()
             print(f"通过: {mode}")
+        if not args.stock_only:
+            # 缩进和等号两侧空白的映射必须与紧凑写法等价。
+            spaced = f"username\n  alice = {a}\n  bob = {b}\n"
+            with proxy(binary, "username", a, b, family, policy=spaced) as port:
+                tcp(a, port, "alice", address(a, tcp_port), a)
+            print("通过: 用户名映射容忍空白")
         if args.stock:
             with proxy(str(pathlib.Path(args.stock).resolve()), "default", a, b, family) as port:
                 tcp(a, port, "alice", address(a, tcp_port), None)

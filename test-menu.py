@@ -362,6 +362,13 @@ fi''', self.bindir)
         self.assert_ok(self.cli("_serve"))
         self.assertIn(f"gost-routed  {self.base}/config/routes.conf -C", self.log())
 
+    def test_routes_menu_reports_missing_routed_binary(self):
+        (self.bindir / "gost-routed").unlink()
+        output = self.assert_menu_ok("9\n2\n0\n0\n0\n")
+        self.assertIn("未安装多出口组件", output)
+        self.assertIn("未找到多出口组件", output)
+        self.assertFalse(self.routes.exists())
+
     def test_routes_invalid_mapping_and_failed_restart_keep_previous_policy(self):
         self.write(self.routes, "ingress\n")
         output = self.assert_menu_ok("9\n3\ninvalid\n0\n0\n0\n")

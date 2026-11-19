@@ -23,7 +23,7 @@ index f9fa73c..ca461f0 100644
  		listener.AddrOption(cfg.Addr),
  		listener.AutherOption(auther),
 diff --git a/handler/socks/v5/connect.go b/handler/socks/v5/connect.go
-index ad4e0e3..844954e 100644
+index ad4e0e3..9de6c2a 100644
 --- a/handler/socks/v5/connect.go
 +++ b/handler/socks/v5/connect.go
 @@ -12,7 +12,7 @@ import (
@@ -35,7 +35,7 @@ index ad4e0e3..844954e 100644
  	log = log.WithFields(map[string]any{
  		"dst": fmt.Sprintf("%s/%s", address, network),
  		"cmd": "connect",
-@@ -31,7 +31,13 @@ func (h *socks5Handler) handleConnect(ctx context.Context, conn net.Conn, networ
+@@ -31,8 +31,21 @@ func (h *socks5Handler) handleConnect(ctx context.Context, conn net.Conn, networ
  		ctx = sx.ContextWithHash(ctx, &sx.Hash{Source: address})
  	}
  
@@ -48,8 +48,16 @@ index ad4e0e3..844954e 100644
 +		cc, err = h.router.Dial(ctx, network, address)
 +	}
  	if err != nil {
++		if isSourceFamilyError(err) {
++			log.Error(err)
++			resp := gosocks5.NewReply(gosocks5.AddrUnsupported, nil)
++			log.Trace(resp)
++			resp.Write(conn)
++			return err
++		}
  		resp := gosocks5.NewReply(gosocks5.NetUnreachable, nil)
  		log.Trace(resp)
+ 		resp.Write(conn)
 diff --git a/handler/socks/v5/handler.go b/handler/socks/v5/handler.go
 index 690ad24..5611ab7 100644
 --- a/handler/socks/v5/handler.go
@@ -153,10 +161,10 @@ index f4b4e86..ee50969 100644
  		resp := gosocks5.NewUserPassResponse(gosocks5.UserPassVer, gosocks5.Succeeded)
 diff --git a/handler/socks/v5/source_route.go b/handler/socks/v5/source_route.go
 new file mode 100644
-index 0000000..0881895
+index 0000000..6ac3da4
 --- /dev/null
 +++ b/handler/socks/v5/source_route.go
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,192 @@
 +package v5
 +
 +import (
@@ -179,6 +187,11 @@ index 0000000..0881895
 +}
 +
 +var routePolicy *sourcePolicy
++
++// errSourceFamily 表示目标地址族与接入 IP 不一致，无法绑定源地址。
++var errSourceFamily = errors.New("socks5 source routing: destination has no address in the source IP family")
++
++func isSourceFamilyError(err error) bool { return errors.Is(err, errSourceFamily) }
 +
 +// SourceRoutingEnabled reports whether the SOCKS5 source policy was loaded.
 +func SourceRoutingEnabled() bool { return routePolicy != nil }
@@ -220,13 +233,17 @@ index 0000000..0881895
 +		if p.mode != "username" {
 +			return nil, fmt.Errorf("line %d: ingress takes no records", line)
 +		}
-+		username, rawIP, ok := strings.Cut(s.Text(), "=")
++		username, rawIP, ok := strings.Cut(text, "=")
++		username = strings.TrimSpace(username)
 +		if !ok || username == "" {
 +			return nil, fmt.Errorf("line %d: expected username=IP", line)
 +		}
 +		ip, err := netip.ParseAddr(strings.TrimSpace(rawIP))
-+		ip = ip.Unmap()
-+		if err != nil || ip.Zone() != "" || !validSource(ip) || (ip.Is6() && ip.IsLinkLocalUnicast()) {
++		if err != nil {
++			return nil, fmt.Errorf("line %d: invalid source IP", line)
++		}
++		ip = ip.Unmap().WithZone("")
++		if !validSource(ip) || (ip.Is6() && ip.IsLinkLocalUnicast()) {
 +			return nil, fmt.Errorf("line %d: invalid or scoped source IP", line)
 +		}
 +		if _, exists := p.users[username]; exists {
@@ -304,16 +321,41 @@ index 0000000..0881895
 +	if err != nil {
 +		return nil, err
 +	}
++	host, port, err := net.SplitHostPort(address)
++	if err != nil {
++		return nil, err
++	}
++	want4 := source.IP.To4() != nil
++	network, family := "tcp6", "IPv6"
++	if want4 {
++		network, family = "tcp4", "IPv4"
++	}
++	target := net.ParseIP(host)
++	if target == nil {
++		// 先确认该域名存在与接入 IP 同族的地址；拨号仍交给系统逐个尝试。
++		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
++		if err != nil {
++			return nil, err
++		}
++		matched := false
++		for _, ip := range ips {
++			if (ip.IP.To4() != nil) == want4 {
++				matched = true
++				break
++			}
++		}
++		if !matched {
++			return nil, fmt.Errorf("%w: %s has no %s address", errSourceFamily, host, family)
++		}
++	} else if (target.To4() != nil) != want4 {
++		return nil, fmt.Errorf("%w: %s is not %s", errSourceFamily, host, family)
++	}
 +	timeout := opts.Timeout
 +	if timeout <= 0 {
 +		timeout = dialer.DefaultTimeout
 +	}
 +	d := net.Dialer{LocalAddr: source, Timeout: timeout}
-+	network := "tcp6"
-+	if source.IP.To4() != nil {
-+		network = "tcp4"
-+	}
-+	return d.DialContext(ctx, network, address)
++	return d.DialContext(ctx, network, net.JoinHostPort(host, port))
 +}
 diff --git a/handler/socks/v5/udp.go b/handler/socks/v5/udp.go
 index 1a4506c..f59fd4f 100644
