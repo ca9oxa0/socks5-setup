@@ -4,17 +4,23 @@
 
 ## 🚀 一键安装
 
-在本修改版源码目录运行：
+已克隆源码时，在仓库根目录运行：
 
 ```bash
 sudo bash install.sh
 ```
 
-安装过程中可自定义端口、用户名、密码，直接回车则随机生成。也可在任意 Linux VPS 上直接运行：
+安装过程可自定义端口、用户名、密码，直接回车则随机生成；结束时会输出连接信息和菜单入口。未克隆源码时，在任意受支持的 Linux VPS 上按登录身份执行：
 
 ```bash
+# root 用户
 bash <(curl -fsSL https://raw.githubusercontent.com/ca9oxa0/socks5-setup/main/install.sh)
+
+# 普通用户；sudo 会关闭进程替换的文件描述符，不能写成 sudo bash <(...)
+curl -fsSL https://raw.githubusercontent.com/ca9oxa0/socks5-setup/main/install.sh | sudo bash
 ```
+
+基础安装不包含 `gost-routed` 多出口组件，需要时按「多出口 IP 配置」继续。完整前置条件、分步验证与故障排查见 [全新部署指引](DEPLOY.md)。
 
 ## 📋 功能
 
@@ -146,17 +152,36 @@ curl -x socks5://user:pass@ip:port https://httpbin.org/ip
 - 配置的是**本机 IP**，不是虚拟机未持有的公网 IP。如果云厂商做了 SNAT，还要核对每个本机地址对应的公网出口。如果多个公网入口经 DNAT 后到达同一个本机地址，接入 IP 模式无法区分它们。
 - 监听端口和用户仍沿用现有配置。请在云安全组和主机防火墙只放行受信客户端。
 - 出口策略只决定转发使用的源地址，不按域名或端口限制目标（仍受下述地址族约束）；需要额外访问控制时，请在 GOST 配置或上游防火墙实现。
-- 标准安装默认仅启用 TCP CONNECT，与上游相同。扩展 GOST 支持在单独管理的 GOST 配置中设置 `handler.metadata.udp: true` 启用 UDP ASSOCIATE；请勿直接修改安装脚本生成的 YAML。启用 UDP 后，转发套接字也绑定到选定出口，客户端需能访问返回的 UDP 中继地址和端口。多出口模式不支持 BIND、MUX BIND 和 GOST 私有 UDP Tunnel。
+- 标准安装默认仅启用 TCP CONNECT。不要直接编辑 `/etc/socks5/config.yaml`：`socks5` 会按 `users.txt` 重新生成并比对配置，手改会被判为“认证配置与 users.txt 不一致”并以退出码 78 拒绝启动。UDP ASSOCIATE 需要单独维护的 GOST 配置和服务（见 [全新部署指引](DEPLOY.md) 的 UDP 边界）；启用后转发套接字同样绑定选定出口，客户端还需能访问 UDP 中继端口。多出口模式不支持 BIND、MUX BIND 和 GOST 私有 UDP Tunnel。
 
-在修改版源码目录中执行。新机器先执行安装；已有安装直接构建和升级，不要重新运行交互安装覆盖用户：
+`gost-routed` 是基础安装的扩展二进制，不能单独作为服务运行；且只有 `/etc/socks5/routes.conf` 存在时服务才会切换到它。全新机器按以下顺序执行（下例在源码目录；未克隆时用上文一键命令）：
 
 ```bash
-sudo bash install.sh                       # 仅在尚未安装时执行
-bash build-routed-gost.sh "$PWD/gost-routed" # 用 Git 和本机 Go（1.21 或更新版本）构建
+# 1) 尚未安装时执行基础安装（任选上文方式）
+sudo bash install.sh          # 已克隆源码；未克隆时用上文一键命令
+# 2) 安装多出口组件（自动匹配已发布架构，目前发布 linux-amd64）
+sudo bash /etc/socks5/installer.sh upgrade
+# 3) 确认版本；此时尚未创建 routes.conf，服务仍使用原版 gost
+/usr/local/bin/gost-routed -V
+```
+
+若 `/etc/socks5/installer.sh` 不存在（较早安装），用源码目录的 `sudo bash install.sh upgrade`，或：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ca9oxa0/socks5-setup/main/install.sh | sudo bash -s -- upgrade
+```
+
+其他架构或需要自行构建时，克隆源码后执行（需要 Linux、`git`、Go 和模块下载网络；脚本按宿主架构构建）：
+
+```bash
+git clone https://github.com/ca9oxa0/socks5-setup.git
+cd socks5-setup
+bash build-routed-gost.sh "$PWD/gost-routed"
+./gost-routed -V
 sudo bash install.sh upgrade "$PWD/gost-routed"
 ```
 
-没有构建环境时可直接在线升级。不带参数时按当前架构从最新发布自动解析资产；已发布的架构以 [Releases](https://github.com/ca9oxa0/socks5-setup/releases) 为准，缺少对应架构时请本地构建：
+在线升级同样支持自动解析、显式 `latest` 或指定地址：
 
 ```bash
 sudo bash install.sh upgrade          # 自动选择与 uname -m 匹配的最新资产
@@ -164,13 +189,13 @@ sudo bash install.sh upgrade latest   # 同上，显式写法
 sudo bash install.sh upgrade https://github.com/ca9oxa0/socks5-setup/releases/download/v3.0.0-rc10-routed.1/gost-routed-linux-amd64
 ```
 
-`upgrade` 和菜单「升级」都接受 `https://` 地址或本地绝对路径，只允许 HTTPS。在线模式读取最近 30 个发布（含预发布），按当前架构匹配完整的二进制文件名；没有匹配资产或 GitHub API 限流时会提示改用显式地址。下载内容会先通过路由契约校验，再替换程序并保留端口和用户，失败时恢复原安装。脚本还会把自身保存到 `/etc/socks5/installer.sh` 供菜单复用；通过管道运行 `bash <(curl ...)` 时自动下载最新安装脚本。
+`upgrade` 和菜单「升级」都接受 `https://` 地址或本地绝对路径，只允许 HTTPS。在线模式读取最近 30 个发布（含预发布），按当前架构匹配完整的二进制文件名；没有匹配资产或 GitHub API 限流时会提示改用显式地址。下载内容会先通过路由契约校验，再替换程序并保留端口和用户，失败时恢复原安装。安装或升级成功后，脚本还会把自身保存到 `/etc/socks5/installer.sh` 供菜单复用；无法读取自身时（如 `curl ... | sudo bash`）自动下载最新脚本。
 
 ### 通过菜单配置出口
 
 运行 `sudo socks5`，选择「出口配置」，可选系统默认、按接入 IP、按用户名或查看当前策略。按用户名模式会逐个询问账号的本机出口 IP，回车跳过该账号；至少要填写一个映射，未映射的账号不能转发。核对策略预览后确认应用。原本停止的服务只保存策略，不会被自动启动（下次启动服务时生效）；运行中的服务会重启并检查监听，应用失败会尝试恢复旧策略和服务。两种绑定模式均需先按上节部署扩展二进制。
 
-也可按以下说明手动维护策略文件。
+也可按以下说明手动维护策略文件。`/etc/socks5/routes.conf` 默认不存在；新建或修改后都要执行下文的 `chmod 600` 并重启服务，菜单方式会自动完成这两步。
 
 ### 规则一：按用户名指定出口
 
