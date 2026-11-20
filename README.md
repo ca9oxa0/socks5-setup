@@ -4,13 +4,7 @@
 
 ## 🚀 一键安装
 
-已克隆源码时，在仓库根目录运行：
-
-```bash
-sudo bash install.sh
-```
-
-安装过程可自定义端口、用户名、密码，直接回车则随机生成；结束时会输出连接信息和菜单入口。未克隆源码时，在任意受支持的 Linux VPS 上按登录身份执行：
+在任意受支持的 Linux VPS 上，按当前登录身份选择一种方式：
 
 ```bash
 # root 用户
@@ -51,16 +45,16 @@ curl -fsSL https://raw.githubusercontent.com/ca9oxa0/socks5-setup/main/install.s
 - 查看日志提供最近 50/200 行，完整历史仍可用 `journalctl -u socks5-proxy`。
 - 修改端口会生成并校验新配置，尝试放行防火墙，运行中的服务重启并确认新端口监听，失败则恢复原端口。修改后需同步更新客户端。
 - 添加或删除用户会重建认证配置并重启服务（即使服务原本停止也会被启动）；删除最后一个用户会停止服务；没有有效用户时服务拒绝启动。
-- 菜单内升级通过保存的 `/etc/socks5/installer.sh` 执行，需输入 https 地址或本地绝对路径（菜单不自动解析 `latest`）；较早版本若提示找不到安装脚本，先在源码目录执行一次 `sudo bash install.sh upgrade`（在线）或指定本地包。
+- 菜单内升级通过保存的 `/etc/socks5/installer.sh` 执行，需输入 https 地址或本地绝对路径（菜单不自动解析 `latest`）；较早版本若提示找不到安装脚本，先执行一次在线升级刷新脚本（见下文「升级」）。
 
-已经部署了本项目多出口版本的实例，可从新版源码目录单独更新菜单，不会重启服务或改动用户、端口及路由配置：
+已部署实例可单独更新管理菜单，不会重启服务或改动用户、端口及路由配置：
 
 ```bash
-sudo bash install.sh update-cli
+curl -fsSL https://raw.githubusercontent.com/ca9oxa0/socks5-setup/main/install.sh | sudo bash -s -- update-cli
 sudo socks5
 ```
 
-若提示现有部署不支持单独更新，请使用下文的原地升级流程。原有命令的调用方式不变；非终端环境下，无参 `socks5` 只打印帮助：
+若提示现有部署不支持单独更新，请使用下文的升级流程。原有命令的调用方式不变；非终端环境下，无参 `socks5` 只打印帮助：
 
 ```bash
 socks5 menu        # 打开交互菜单
@@ -104,7 +98,7 @@ socks5 help        # 查看命令帮助
 ### 安装
 
 ```
-$ sudo bash install.sh
+$ bash <(curl -fsSL https://raw.githubusercontent.com/ca9oxa0/socks5-setup/main/install.sh)
 
 ╔═══════════════════════════════════════╗
 ║     SOCKS5 一键部署脚本               ║
@@ -154,39 +148,30 @@ curl -x socks5://user:pass@ip:port https://httpbin.org/ip
 - 出口策略只决定转发使用的源地址，不按域名或端口限制目标（仍受下述地址族约束）；需要额外访问控制时，请在 GOST 配置或上游防火墙实现。
 - 标准安装默认仅启用 TCP CONNECT。不要直接编辑 `/etc/socks5/config.yaml`：`socks5` 会按 `users.txt` 重新生成并比对配置，手改会被判为“认证配置与 users.txt 不一致”并以退出码 78 拒绝启动。UDP ASSOCIATE 需要单独维护的 GOST 配置和服务（见 [全新部署指引](DEPLOY.md) 的 UDP 边界）；启用后转发套接字同样绑定选定出口，客户端还需能访问 UDP 中继端口。多出口模式不支持 BIND、MUX BIND 和 GOST 私有 UDP Tunnel。
 
-`gost-routed` 是基础安装的扩展二进制，不能单独作为服务运行；且只有 `/etc/socks5/routes.conf` 存在时服务才会切换到它。全新机器按以下顺序执行（下例在源码目录；未克隆时用上文一键命令）：
+`gost-routed` 是基础安装的扩展二进制，不能单独作为服务运行；且只有 `/etc/socks5/routes.conf` 存在时服务才会切换到它。全新机器按以下顺序执行：
 
 ```bash
-# 1) 尚未安装时执行基础安装（任选上文方式）
-sudo bash install.sh          # 已克隆源码；未克隆时用上文一键命令
+# 1) 尚未安装时执行基础安装（命令见上文）
 # 2) 安装多出口组件（自动匹配已发布架构，目前发布 linux-amd64）
 sudo bash /etc/socks5/installer.sh upgrade
 # 3) 确认版本；此时尚未创建 routes.conf，服务仍使用原版 gost
 /usr/local/bin/gost-routed -V
 ```
 
-若 `/etc/socks5/installer.sh` 不存在（较早安装），用源码目录的 `sudo bash install.sh upgrade`，或：
+若 `/etc/socks5/installer.sh` 不存在（较早安装），执行：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ca9oxa0/socks5-setup/main/install.sh | sudo bash -s -- upgrade
 ```
 
-其他架构或需要自行构建时，克隆源码后执行（需要 Linux、`git`、Go 和模块下载网络；脚本按宿主架构构建）：
-
-```bash
-git clone https://github.com/ca9oxa0/socks5-setup.git
-cd socks5-setup
-bash build-routed-gost.sh "$PWD/gost-routed"
-./gost-routed -V
-sudo bash install.sh upgrade "$PWD/gost-routed"
-```
+在线发布的 `gost-routed` 目前仅提供 linux-amd64；其他架构在提供对应资产前无法启用多出口组件，基础代理不受影响。
 
 在线升级同样支持自动解析、显式 `latest` 或指定地址：
 
 ```bash
-sudo bash install.sh upgrade          # 自动选择与 uname -m 匹配的最新资产
-sudo bash install.sh upgrade latest   # 同上，显式写法
-sudo bash install.sh upgrade https://github.com/ca9oxa0/socks5-setup/releases/download/v3.0.0-rc10-routed.1/gost-routed-linux-amd64
+sudo bash /etc/socks5/installer.sh upgrade          # 自动选择与 uname -m 匹配的最新资产
+sudo bash /etc/socks5/installer.sh upgrade latest   # 同上，显式写法
+sudo bash /etc/socks5/installer.sh upgrade https://github.com/ca9oxa0/socks5-setup/releases/download/v3.0.0-rc10-routed.1/gost-routed-linux-amd64
 ```
 
 `upgrade` 和菜单「升级」都接受 `https://` 地址或本地绝对路径，只允许 HTTPS。在线模式读取最近 30 个发布（含预发布），按当前架构匹配完整的二进制文件名；没有匹配资产或 GitHub API 限流时会提示改用显式地址。下载内容会先通过路由契约校验，再替换程序并保留端口和用户，失败时恢复原安装。安装或升级成功后，脚本还会把自身保存到 `/etc/socks5/installer.sh` 供菜单复用；无法读取自身时（如 `curl ... | sudo bash`）自动下载最新脚本。
@@ -238,17 +223,7 @@ sudo mv /etc/socks5/routes.conf /etc/socks5/routes.conf.disabled
 sudo socks5 restart
 ```
 
-### 本地验证与真实 VPS 验收
-
-测试脚本不修改系统配置，也不需要外部服务。它会启动临时代理及 TCP/UDP 接收端，检查接收端所见的源 IP、并发连接、认证，以及未映射用户是否被拒绝。传入两个已经配置在测试机上的同族地址。下例只适用于可修改的 Linux 测试机；如果 `127.0.0.2/32` 原本就存在，不要重复添加或在测试后删除。
-
-```bash
-sudo ip addr add 127.0.0.2/32 dev lo
-python3 test-routes.py ./gost-routed --stock /usr/local/bin/gost
-sudo ip addr del 127.0.0.2/32 dev lo
-```
-
-如果测试机禁止跨接口访问，可传入两个已配置的 IP，并加 `--separate-observers` 让每个接收端监听对应地址。该选项依然核对实际源 IP，但不能代替两条路径访问同一公网目的地的验收。
+### 真实 VPS 验收
 
 在真实 VPS 上，从外部测试机向自己的公网 IP 回显端点发送请求。例如，出口回显端点在 `observer.example.net`，返回它实际看到的 TCP 源 IP：
 
@@ -264,10 +239,6 @@ curl --fail --max-time 15 --proxy 'socks5h://入口B:端口' --proxy-user alice 
 2. **接入 IP 模式**：同一用户对入口 A、B 分别请求，预期分别为出口 A、B。
 3. 每组重复及并发执行，记录接入地址、账号、预期公网 IP 和回显值。补测错误密码、无映射用户、重启、增删用户与回滚。在有带外管理的测试 VPS 中让一个出口不可用时，应看到该规则转发失败，另一个出口仍按原规则工作，不能串到另一出口。
 4. 如启用 UDP ASSOCIATE，用支持该命令的客户端及受控的外部 UDP 接收端按同一矩阵核对源 IP；仅运行 `curl` 不代表验证了 UDP。
-
-### 管理菜单测试
-
-在源码目录运行 `python3 test-menu.py`。测试使用临时配置和模拟服务，不会启停真实代理或写入系统目录。Linux 使用伪终端验证交互；Windows 可使用 Git Bash 运行模拟交互测试，会跳过需要伪终端的用例。
 
 ## ⚠️ 注意事项
 
