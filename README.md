@@ -34,7 +34,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ca9oxa0/socks5-setup/main/in
 
 - 查看日志提供最近 50/200 行，完整历史仍可用 `journalctl -u socks5-proxy`。
 - 修改端口会生成并校验新配置，尝试放行防火墙，运行中的服务重启并确认新端口监听，失败则恢复原端口。修改后需同步更新客户端。
-- 菜单内升级从本机复制保存的 `/etc/socks5/installer.sh` 执行，需输入升级二进制的绝对路径；较早版本若提示找不到安装脚本，先在源码目录执行一次 `sudo bash install.sh upgrade /路径/gost-routed`。
+- 菜单内升级通过保存的 `/etc/socks5/installer.sh` 执行，可输入 https 地址或本地绝对路径；较早版本若提示找不到安装脚本，先在源码目录执行一次 `sudo bash install.sh upgrade`（在线）或指定本地包。
 
 已经部署了本项目多出口版本的实例，可从新版源码目录单独更新菜单，不会重启服务或改动用户、端口及路由配置：
 
@@ -142,13 +142,15 @@ bash build-routed-gost.sh "$PWD/gost-routed" # 用 Git 和本机 Go（1.21 或�
 sudo bash install.sh upgrade "$PWD/gost-routed"
 ```
 
-没有构建环境时可直接在线升级（仅提供 linux-amd64 资产；其他架构请本地构建）：
+没有构建环境时可直接在线升级。不带参数时按当前架构从最新发布自动解析资产；已发布的架构以 [Releases](https://github.com/ca9oxa0/socks5-setup/releases) 为准，缺少对应架构时请本地构建：
 
 ```bash
+sudo bash install.sh upgrade          # 自动选择与 uname -m 匹配的最新资产
+sudo bash install.sh upgrade latest   # 同上，显式写法
 sudo bash install.sh upgrade https://github.com/ca9oxa0/socks5-setup/releases/download/v3.0.0-rc10-routed.1/gost-routed-linux-amd64
 ```
 
-`upgrade` 和菜单「升级」都接受 `https://` 地址或本地绝对路径；只允许 HTTPS。下载内容会先通过路由契约校验，再替换程序并保留端口和用户，失败时恢复原安装。升级包地址可从 [Releases](https://github.com/ca9oxa0/socks5-setup/releases) 获取。
+`upgrade` 和菜单「升级」都接受 `https://` 地址或本地绝对路径，只允许 HTTPS。在线模式读取最近 30 个发布（含预发布），跳过仅有校验文件的条目；GitHub API 限流时会提示改用显式地址。下载内容会先通过路由契约校验，再替换程序并保留端口和用户，失败时恢复原安装。脚本还会把自身保存到 `/etc/socks5/installer.sh` 供菜单复用；通过管道运行 `bash <(curl ...)` 时自动下载最新安装脚本。
 
 ### 通过菜单配置出口
 

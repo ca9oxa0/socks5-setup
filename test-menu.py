@@ -4,6 +4,7 @@
 import errno
 import os
 import pathlib
+import platform
 import re
 import select
 import shutil
@@ -19,6 +20,15 @@ TIMEOUT = 20
 ALICE = "alice:fixture-alice-secret"
 PORT = "10842"
 PUBLIC_IP = "192.0.2.42"
+
+
+def host_arch():
+    """按 install.sh detect_arch 的规则换算当前架构。"""
+    machine = platform.machine().lower()
+    if machine.startswith("armv7") or machine == "armv8l":
+        return "armv7"
+    return {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64",
+            "arm64": "arm64", "i386": "386", "i686": "386"}.get(machine, "amd64")
 
 
 def find_bash():
@@ -125,7 +135,72 @@ esac''')
 if [[ -e active ]]; then
     printf 'LISTEN 0 64 0.0.0.0:10842 0.0.0.0:* users:(("gost",pid=4242,fd=3))\n'
 fi''')
-        command("curl", f"printf 'curl %s\\n' \"$*\" >> events\necho {PUBLIC_IP}")
+        # 在线升级夹具：最新发布只有校验文件，须跳过并选择上一个发布的真实二进制。
+        base = "https://github.com/ca9oxa0/socks5-setup/releases/download"
+        checksums = ",\n".join(
+            f'    {{"browser_download_url": "{base}/v9.9.9/gost-routed-linux-{arch}.sha256"}}'
+            for arch in ("amd64", "arm64", "armv7", "386"))
+        binaries = ",\n".join(
+            f'    {{"browser_download_url": "{base}/v9.9.8/gost-routed-linux-{arch}"}}'
+            for arch in ("amd64", "arm64", "armv7", "386"))
+        self.write(self.root / "fixture-releases.json",
+                   "[\n"
+                   '  {"tag_name": "v9.9.9", "prerelease": true, "assets": [\n'
+                   f"{checksums}\n"
+                   "  ]},\n"
+                   '  {"tag_name": "v9.9.8", "assets": [\n'
+                   f"{binaries}\n"
+                   "  ]}\n"
+                   "]\n")
+        self.write(self.root / "fixture-asset", '''#!/bin/bash
+printf 'downloaded %s %s %s\\n' "${SOCKS5_ROUTE_CHECK:-}" "${SOCKS5_ROUTE_FILE:-}" "$*" >> events
+if [[ "$1" == -V ]]; then
+    [[ "${SOCKS5_ROUTE_CHECK:-}" == 1 && -r "${SOCKS5_ROUTE_FILE:-}" ]] || exit 77
+fi
+''')
+        self.write(self.root / "fixture-installer", '''#!/usr/bin/env bash
+# ============ 入口 ============
+echo fixture-installer-updated
+''')
+        self.write(self.root / "fixture-installer-broken", "#!/usr/bin/env bash\nif [[\n")
+        self.write(self.root / "fixture-installer-no-marker", "#!/usr/bin/env bash\necho fixture\n")
+        command("curl", '''printf 'curl %s\\n' "$*" >> events
+url=""; target=""
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+    case "${args[i]}" in
+        -o) target="${args[i+1]}" ;;
+        https://*) url="${args[i]}" ;;
+    esac
+done
+case "$url" in
+    https://api.github.com/*)
+        case "${FIXTURE_RELEASES:-ok}" in
+            error) exit 22 ;;
+            limit) echo '{"message":"API rate limit exceeded"}'; exit 0 ;;
+            empty) echo '[]'; exit 0 ;;
+        esac
+        cat fixture-releases.json
+        ;;
+    *raw.githubusercontent.com*)
+        content=fixture-installer
+        case "${FIXTURE_INSTALLER:-ok}" in
+            broken) content=fixture-installer-broken ;;
+            no-marker) content=fixture-installer-no-marker ;;
+            error) exit 22 ;;
+        esac
+        if [[ -n "$target" ]]; then cp "$content" "$target"; else cat "$content"; fi
+        ;;
+    */releases/download/*)
+        case "${FIXTURE_ASSET:-ok}" in
+            error) exit 22 ;;
+            empty) : > "$target"; exit 0 ;;
+        esac
+        cp fixture-asset "$target"
+        chmod 700 "$target"
+        ;;
+    *) echo __PUBLIC_IP__ ;;
+esac'''.replace("__PUBLIC_IP__", PUBLIC_IP))
         command("journalctl", '''printf 'journalctl %s\\n' "$*" >> events
 echo fixture-log-line''')
         # Git Bash 没有 flock；单进程用例只记录加锁调用。
@@ -149,8 +224,29 @@ fi''', self.bindir)
                                            result.stdout.decode().replace("\r\n", "\n"),
                                            result.stderr.decode().replace("\r\n", "\n"))
 
+    def save_installer_piped(self):
+        # $0=/dev/fd/63 模拟 bash <(curl ...) 运行，触发脚本副本的下载分支。
+        args = self.bash + ["-c", 'export PATH="$TEST_PATH"; . ./functions; save_installer',
+                            "/dev/fd/63"]
+        result = subprocess.run(args, cwd=self.root, env=self.env,
+                                capture_output=True, timeout=TIMEOUT)
+        return subprocess.CompletedProcess(result.args, result.returncode,
+                                           result.stdout.decode().replace("\r\n", "\n"),
+                                           result.stderr.decode().replace("\r\n", "\n"))
+
     def cli(self, *args, data=""):
         return self.run_bash(["./bin/socks5", *args], data)
+
+    def set_env(self, key, value):
+        previous = self.env.get(key)
+        self.env[key] = value
+
+        def restore():
+            if previous is None:
+                self.env.pop(key, None)
+            else:
+                self.env[key] = previous
+        self.addCleanup(restore)
 
     def log(self):
         return self.events.read_text(encoding="utf-8") if self.events.exists() else ""
@@ -423,6 +519,86 @@ fi''', self.bindir)
         output = self.assert_menu_ok(f"12\n{url}\ny\n0\n")
         self.assertIn(url, output)
         self.assertIn(f"installer upgrade {url}", self.log())
+
+    def test_online_upgrade_resolves_latest_asset_for_arch(self):
+        arch = host_arch()
+        result = self.run_bash(["./installer", "upgrade"])
+        self.assert_ok(result)
+        self.assertIn("正在解析最新发布", result.stdout)
+        self.assertIn("GOST 已升级", result.stdout)
+        log = self.log()
+        self.assertIn("https://api.github.com/repos/ca9oxa0/socks5-setup/releases", log)
+        # 跳过仅有校验文件的最新发布，选中带完整文件名的真实资产。
+        self.assertIn(f"/v9.9.8/gost-routed-linux-{arch}", log)
+        self.assertNotIn(".sha256", log)
+        # 路由契约校验执行了下载的二进制，而不是本机旧组件。
+        self.assertIn("downloaded 1", log)
+        self.assertTrue((self.config / "installer.sh").is_file())
+        self.assertEqual(list(self.config.glob(".upgrade.*")), [])
+        self.assertEqual(list(self.config.glob(".installer.*")), [])
+
+    def test_online_upgrade_accepts_latest_keyword(self):
+        result = self.run_bash(["./installer", "upgrade", "latest"])
+        self.assert_ok(result)
+        self.assertIn("正在解析最新发布", result.stdout)
+
+    def test_online_upgrade_requires_existing_install(self):
+        self.unit.unlink()
+        result = self.run_bash(["./installer", "upgrade"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("未找到已有安装", result.stdout + result.stderr)
+        self.assertNotIn("api.github.com", self.log())
+
+    def test_save_installer_refreshes_copy_when_piped(self):
+        for mode, expected in (("broken", "old-installer"),
+                               ("no-marker", "old-installer"),
+                               ("ok", "fixture-installer-updated")):
+            with self.subTest(mode=mode):
+                self.write(self.config / "installer.sh", "old-installer\n")
+                self.set_env("FIXTURE_INSTALLER", mode)
+                result = self.save_installer_piped()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(expected, (self.config / "installer.sh").read_text(encoding="utf-8"))
+                self.assertEqual(list(self.config.glob(".installer.*")), [])
+        self.assertIn("raw.githubusercontent.com/ca9oxa0/socks5-setup/main/install.sh", self.log())
+
+    def test_online_upgrade_reports_missing_asset_and_rate_limit(self):
+        before = (self.bindir / "gost-routed").read_bytes()
+        for mode, message in (("empty", "没有适用于"), ("limit", "限流")):
+            with self.subTest(mode=mode):
+                self.set_env("FIXTURE_RELEASES", mode)
+                result = self.run_bash(["./installer", "upgrade"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stdout + result.stderr)
+                self.assertEqual((self.bindir / "gost-routed").read_bytes(), before)
+
+    def test_online_upgrade_reports_api_failure(self):
+        self.set_env("FIXTURE_RELEASES", "error")
+        result = self.run_bash(["./installer", "upgrade"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("无法获取发布信息", result.stdout)
+        self.assertEqual(list(self.config.glob(".upgrade.*")), [])
+
+    def test_online_upgrade_rejects_bad_downloads(self):
+        before = (self.bindir / "gost-routed").read_bytes()
+        for mode, message in (("error", "下载失败"), ("empty", "下载内容为空")):
+            with self.subTest(mode=mode):
+                self.set_env("FIXTURE_ASSET", mode)
+                result = self.run_bash(["./installer", "upgrade"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stdout)
+                self.assertEqual((self.bindir / "gost-routed").read_bytes(), before)
+                self.assertEqual(list(self.config.glob(".upgrade.*")), [])
+
+    def test_online_upgrade_rejects_http_and_extra_args(self):
+        before = (self.bindir / "gost-routed").read_bytes()
+        for args, message in ((("http://example.test/gost",), "仅支持 https"),
+                              (("a", "b"), "用法")):
+            with self.subTest(args=args):
+                result = self.run_bash(["./installer", "upgrade", *args])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stdout)
+        self.assertEqual((self.bindir / "gost-routed").read_bytes(), before)
 
     def test_legacy_commands_still_work_with_pipes(self):
         self.assertIn("fixture-service-status", self.cli("status").stdout)

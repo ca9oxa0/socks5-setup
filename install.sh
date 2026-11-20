@@ -5,7 +5,8 @@
 #
 # 用法:
 #   安装:   bash <(curl -fsSL https://raw.githubusercontent.com/ca9oxa0/socks5-setup/main/install.sh)
-#   升级:   sudo bash install.sh upgrade /absolute/path/to/gost-routed
+#   升级:   sudo bash install.sh upgrade                    # 在线升级到最新发布
+#           sudo bash install.sh upgrade <https://地址|绝对路径>
 #   卸载:   socks5 uninstall
 #   状态:   socks5 status
 #   添加用户: socks5 add
@@ -36,6 +37,10 @@ ROUTED_BIN="${INSTALL_DIR}/gost-routed"
 SOCKS5_CMD="${INSTALL_DIR}/socks5"
 GOST_VERSION="3.0.0-rc10"
 GOST_REPO="https://github.com/go-gost/gost/releases/download/v${GOST_VERSION}"
+# 在线升级只信任本仓库的发布信息；与脚本头部的部署地址保持一致。
+PROJECT_SLUG="ca9oxa0/socks5-setup"
+RELEASES_API="https://api.github.com/repos/${PROJECT_SLUG}/releases?per_page=30"
+INSTALLER_URL="https://raw.githubusercontent.com/${PROJECT_SLUG}/main/install.sh"
 
 # ============ 工具函数 ============
 msg()   { echo -e "${GREEN}[✓]${NC} $*"; }
@@ -302,7 +307,7 @@ check_route() {
     local bin="$1" route="${2:-$ROUTE_FILE}" output
     [[ -e "$route" || -L "$route" ]] || return 0
     [[ -f "$route" && -r "$route" ]] || err "无法读取路由文件 ${route}"
-    [[ -x "$bin" ]] || err "未找到多出口组件 ${bin}；请先运行 sudo bash install.sh upgrade /路径/gost-routed"
+    [[ -x "$bin" ]] || err "未找到多出口组件 ${bin}；请先运行 sudo bash install.sh upgrade（在线）或指定本地包"
     # 使用 -V 防止误启动原版二进制；自定义版校验成功后先于 -V 退出。
     if ! output=$(SOCKS5_ROUTE_CHECK=1 SOCKS5_ROUTE_FILE="$route" "$bin" -V 2>&1); then
         [[ -z "$output" ]] || printf '%s\n' "$output" >&2
@@ -636,7 +641,7 @@ route_menu() {
     local -a users=()
     if [[ ! -x "$ROUTED_BIN" ]]; then
         warn "未安装多出口组件（${ROUTED_BIN}），出口策略无法生效"
-        warn "安装方法：sudo bash install.sh upgrade /路径/gost-routed"
+        warn "安装方法：sudo bash install.sh upgrade（在线）或指定本地包"
     fi
     while :; do
         printf '\n出口配置\n'
@@ -1066,6 +1071,31 @@ do_update_cli() (
     msg "管理菜单已更新，未重启服务。运行 sudo socks5 打开菜单。"
 )
 
+# 保存安装脚本副本供管理菜单复用。通过管道运行时（$0 为 /dev/fd/*），
+# 改为下载最新脚本；只有语法和入口标记完整时才覆盖，避免保存截断内容。
+save_installer() {
+    local source_path="$0" tmp
+    case "$source_path" in
+        /dev/fd/*|/proc/*|"") ;;
+        *)
+            if [[ -f "$source_path" && -r "$source_path" ]]; then
+                install -m 700 -- "$source_path" "$CONFIG_DIR/installer.sh" 2>/dev/null || true
+                return 0
+            fi
+            ;;
+    esac
+    command -v curl >/dev/null 2>&1 || return 0
+    tmp=$(mktemp "${CONFIG_DIR}/.installer.XXXXXX") || return 0
+    if curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 60 \
+        -o "$tmp" "$INSTALLER_URL" &&
+        bash -n "$tmp" 2>/dev/null &&
+        grep -q '^# ============ 入口' "$tmp"; then
+        install -m 700 -- "$tmp" "$CONFIG_DIR/installer.sh" 2>/dev/null || true
+    fi
+    rm -f -- "$tmp"
+    return 0
+}
+
 # ============ 原地升级 ============
 do_upgrade() (
     check_root
@@ -1116,7 +1146,7 @@ do_upgrade() (
     bash "$work/socks5" _route_check "$work/gost-routed" "$work/probe"
     bash "$work/socks5" _route_check "$work/gost-routed"
     # 保留安装脚本副本，供管理菜单内的升级使用。
-    if [[ -f "$0" && -r "$0" ]]; then install -m 700 -- "$0" "$CONFIG_DIR/installer.sh" || true; fi
+    save_installer
 
     if systemctl is-active --quiet "$SERVICE_NAME"; then was_active=1; fi
     for i in "${!targets[@]}"; do
@@ -1163,6 +1193,33 @@ do_upgrade() (
         fi
     fi
     err "升级失败"
+)
+
+# ============ 在线升级到最新发布 ============
+# 不带参数时按当前架构从发布列表解析资产地址，再复用 do_upgrade 的下载、
+# 路由契约校验、替换和失败恢复流程。只接受文件名与架构完全一致的资产。
+do_online_upgrade() (
+    check_root
+    local json url
+    [[ $# -eq 0 ]] || err "用法：sudo bash install.sh upgrade"
+    [[ -x "$GOST_BIN" && -f "$CONFIG_FILE" && -f "$USERS_FILE" && -f "$SERVICE_FILE" ]] ||
+        err "未找到已有安装，请先运行 bash install.sh"
+    command -v curl >/dev/null 2>&1 || err "未找到 curl，无法在线升级"
+    detect_arch
+    info "正在解析最新发布..."
+    json=$(curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 30 \
+        -H 'Accept: application/vnd.github+json' "$RELEASES_API") ||
+        err "无法获取发布信息，请检查网络或改用 upgrade <https 地址>"
+    [[ "$json" != *'API rate limit'* ]] || err "GitHub API 限流，请稍后重试或改用 upgrade <https 地址>"
+    # 发布按时间倒序排列；取第一个匹配当前架构的资产（含预发布版本）。
+    url=$(printf '%s\n' "$json" |
+        grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*/gost-routed-linux-'"$ARCH"'"' |
+        head -n 1 |
+        sed -E 's/^.*"(https:[^"]*)"$/\1/') || true
+    [[ -n "$url" ]] ||
+        err "最新发布中没有适用于 ${ARCH} 的升级包；请在源码目录构建后使用 upgrade <绝对路径>"
+    info "升级包：${url}"
+    do_upgrade "$url"
 )
 
 # ============ 主安装流程 ============
@@ -1238,7 +1295,7 @@ do_install() (
     install -m 755 -- "$work/socks5" "$SOCKS5_CMD"
     install -m 644 -- "$work/service" "$SERVICE_FILE"
     # 保留安装脚本副本，供管理菜单内的升级使用。
-    if [[ -f "$0" && -r "$0" ]]; then install -m 700 -- "$0" "$CONFIG_DIR/installer.sh" || true; fi
+    save_installer
 
     configure_firewall "$S5_PORT"
     systemctl daemon-reload
@@ -1277,7 +1334,15 @@ do_install() (
 # 如果直接运行则执行安装
 case "${1:-install}" in
     install) do_install ;;
-    upgrade) shift; do_upgrade "$@" ;;
+    upgrade)
+        shift
+        # 无参数或 latest：在线解析最新发布；否则按 https 地址或本地路径升级。
+        if [[ $# -eq 0 ]] || [[ $# -eq 1 && "$1" == latest ]]; then
+            do_online_upgrade
+        else
+            do_upgrade "$@"
+        fi
+        ;;
     update-cli) shift; do_update_cli "$@" ;;
     *)
         # 如果存在管理命令则转发
