@@ -18,23 +18,34 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ca9oxa0/socks5-setup/main/in
 
 ## 📋 功能
 
-- ✅ 自动检测系统（Ubuntu/Debian/CentOS/Rocky/Alpine/Arch 等）
-- ✅ 自动检测架构（amd64/arm64/armv7）
+- ✅ 自动检测 Linux 发行版与包管理器（apt/yum/apk/pacman/zypper）
+- ✅ 自动检测架构（amd64/arm64/armv7/386）
 - ✅ 用户名 + 密码认证
 - ✅ 随机端口 & 密码（可自定义）
 - ✅ 开机自启（systemd）
-- ✅ 自动放行防火墙（ufw/firewalld/iptables）
+- ✅ 检测并放行防火墙端口（ufw/firewalld/iptables）
 - ✅ 多用户管理
 - ✅ 一键卸载
 - ✅ 安装完成输出 `socks5://` 连接链接
 
 ## 🔧 管理命令
 
-安装完成后，在终端运行 `sudo socks5` 或 `sudo socks5 menu`。输入编号即可查看服务状态和连接信息、启停服务、管理用户、配置出口、查看日志、修改端口、升级或卸载。查看用户列表只显示用户名；连接信息包含密码，请只在可信终端中查看。重要变更会先显示预览或确认提示，直接回车表示取消；执行失败时可重试或返回。
+安装完成后，在终端运行 `sudo socks5` 或 `sudo socks5 menu`。菜单项与脚本一致：
+
+```text
+ 1) 状态   2) 连接信息   3) 用户列表
+ 4) 启动   5) 停止       6) 重启
+ 7) 添加   8) 删除       9) 出口配置
+10) 查看日志  11) 修改端口  12) 升级
+13) 卸载   0) 退出
+```
+
+菜单和所有子命令都需要 root。菜单中的「用户列表」只显示用户名；「连接信息」以及 `socks5 info`、`socks5 list` 会输出包含密码的 `socks5://` 链接，`socks5 add` 也会输出新账号链接，请只在可信终端中查看。菜单添加用户时密码输入不回显；命令行 `socks5 add` 在终端中输入的密码会回显。重要变更会先显示预览或确认提示，直接回车表示取消；执行失败时可重试或返回。`socks5`/`socks5 menu` 需要交互式终端，管道或脚本中请使用子命令。
 
 - 查看日志提供最近 50/200 行，完整历史仍可用 `journalctl -u socks5-proxy`。
 - 修改端口会生成并校验新配置，尝试放行防火墙，运行中的服务重启并确认新端口监听，失败则恢复原端口。修改后需同步更新客户端。
-- 菜单内升级通过保存的 `/etc/socks5/installer.sh` 执行，可输入 https 地址或本地绝对路径；较早版本若提示找不到安装脚本，先在源码目录执行一次 `sudo bash install.sh upgrade`（在线）或指定本地包。
+- 添加或删除用户会重建认证配置并重启服务（即使服务原本停止也会被启动）；删除最后一个用户会停止服务；没有有效用户时服务拒绝启动。
+- 菜单内升级通过保存的 `/etc/socks5/installer.sh` 执行，需输入 https 地址或本地绝对路径（菜单不自动解析 `latest`）；较早版本若提示找不到安装脚本，先在源码目录执行一次 `sudo bash install.sh upgrade`（在线）或指定本地包。
 
 已经部署了本项目多出口版本的实例，可从新版源码目录单独更新菜单，不会重启服务或改动用户、端口及路由配置：
 
@@ -46,6 +57,7 @@ sudo socks5
 若提示现有部署不支持单独更新，请使用下文的原地升级流程。原有命令的调用方式不变；非终端环境下，无参 `socks5` 只打印帮助：
 
 ```bash
+socks5 menu        # 打开交互菜单
 socks5 info        # 查看连接信息
 socks5 status      # 查看服务状态
 socks5 start       # 启动服务
@@ -53,8 +65,9 @@ socks5 stop        # 停止服务
 socks5 restart     # 重启服务
 socks5 add         # 添加用户
 socks5 del         # 删除用户
-socks5 list        # 查看用户列表
+socks5 list        # 查看用户列表（输出含密码链接）
 socks5 uninstall   # 一键卸载
+socks5 help        # 查看命令帮助
 ```
 
 ## 📦 技术栈
@@ -78,7 +91,7 @@ socks5 uninstall   # 一键卸载
 | Alpine | 3.15+ | ❌ 默认 OpenRC，需自行改用 systemd |
 | Arch Linux | latest | ✅ |
 
-支持架构: `amd64` `arm64` `armv7`
+支持架构: `amd64` `arm64` `armv7` `386`
 
 ## 📖 使用示例
 
@@ -115,7 +128,7 @@ $ sudo bash install.sh
   socks5://user_a3Kx:xK9mP2vL8nQw5rT1@1.2.3.4:34521
 
 ═══════════════════════════════════════════
-  管理命令: socks5 help
+  管理菜单: socks5（命令帮助：socks5 help）
 ═══════════════════════════════════════════
 ```
 
@@ -132,6 +145,7 @@ curl -x socks5://user:pass@ip:port https://httpbin.org/ip
 - VPS 使用 systemd，且待绑定地址已配置在本机，并有正常的源地址路由。可用 `ip -br addr` 查看本地地址，再用 `ip route get <目标地址> from <出口地址>` 检查路由。示例中的文档保留地址不能直接使用。
 - 配置的是**本机 IP**，不是虚拟机未持有的公网 IP。如果云厂商做了 SNAT，还要核对每个本机地址对应的公网出口。如果多个公网入口经 DNAT 后到达同一个本机地址，接入 IP 模式无法区分它们。
 - 监听端口和用户仍沿用现有配置。请在云安全组和主机防火墙只放行受信客户端。
+- 出口策略只决定转发使用的源地址，不按域名或端口限制目标（仍受下述地址族约束）；需要额外访问控制时，请在 GOST 配置或上游防火墙实现。
 - 标准安装默认仅启用 TCP CONNECT，与上游相同。扩展 GOST 支持在单独管理的 GOST 配置中设置 `handler.metadata.udp: true` 启用 UDP ASSOCIATE；请勿直接修改安装脚本生成的 YAML。启用 UDP 后，转发套接字也绑定到选定出口，客户端需能访问返回的 UDP 中继地址和端口。多出口模式不支持 BIND、MUX BIND 和 GOST 私有 UDP Tunnel。
 
 在修改版源码目录中执行。新机器先执行安装；已有安装直接构建和升级，不要重新运行交互安装覆盖用户：
@@ -150,11 +164,11 @@ sudo bash install.sh upgrade latest   # 同上，显式写法
 sudo bash install.sh upgrade https://github.com/ca9oxa0/socks5-setup/releases/download/v3.0.0-rc10-routed.1/gost-routed-linux-amd64
 ```
 
-`upgrade` 和菜单「升级」都接受 `https://` 地址或本地绝对路径，只允许 HTTPS。在线模式读取最近 30 个发布（含预发布），跳过仅有校验文件的条目；GitHub API 限流时会提示改用显式地址。下载内容会先通过路由契约校验，再替换程序并保留端口和用户，失败时恢复原安装。脚本还会把自身保存到 `/etc/socks5/installer.sh` 供菜单复用；通过管道运行 `bash <(curl ...)` 时自动下载最新安装脚本。
+`upgrade` 和菜单「升级」都接受 `https://` 地址或本地绝对路径，只允许 HTTPS。在线模式读取最近 30 个发布（含预发布），按当前架构匹配完整的二进制文件名；没有匹配资产或 GitHub API 限流时会提示改用显式地址。下载内容会先通过路由契约校验，再替换程序并保留端口和用户，失败时恢复原安装。脚本还会把自身保存到 `/etc/socks5/installer.sh` 供菜单复用；通过管道运行 `bash <(curl ...)` 时自动下载最新安装脚本。
 
 ### 通过菜单配置出口
 
-运行 `sudo socks5`，选择「出口配置」，再选系统默认、按接入 IP 或按用户名。按用户名模式会引导你为账号填写本机出口 IP；未映射的账号不能转发。核对预览后确认应用。原本停止的服务只保存策略，不会被自动启动；运行中的服务会重启并检查监听，应用失败会尝试恢复旧策略和服务。两种绑定模式均需先按上节部署扩展二进制。
+运行 `sudo socks5`，选择「出口配置」，可选系统默认、按接入 IP、按用户名或查看当前策略。按用户名模式会逐个询问账号的本机出口 IP，回车跳过该账号；至少要填写一个映射，未映射的账号不能转发。核对策略预览后确认应用。原本停止的服务只保存策略，不会被自动启动（下次启动服务时生效）；运行中的服务会重启并检查监听，应用失败会尝试恢复旧策略和服务。两种绑定模式均需先按上节部署扩展二进制。
 
 也可按以下说明手动维护策略文件。
 
@@ -219,6 +233,8 @@ curl --fail --max-time 15 --proxy 'socks5h://入口A:端口' --proxy-user bob   
 curl --fail --max-time 15 --proxy 'socks5h://入口B:端口' --proxy-user alice https://observer.example.net/ip
 ```
 
+未在命令行提供密码时，`curl` 会提示输入 `--proxy-user` 对应的密码。
+
 1. **用户名模式**：运行前两条，预期分别为出口 A、B。再从入口 B 用 `alice`，预期仍为出口 A。
 2. **接入 IP 模式**：同一用户对入口 A、B 分别请求，预期分别为出口 A、B。
 3. 每组重复及并发执行，记录接入地址、账号、预期公网 IP 和回显值。补测错误密码、无映射用户、重启、增删用户与回滚。在有带外管理的测试 VPS 中让一个出口不可用时，应看到该规则转发失败，另一个出口仍按原规则工作，不能串到另一出口。
@@ -226,7 +242,7 @@ curl --fail --max-time 15 --proxy 'socks5h://入口B:端口' --proxy-user alice 
 
 ### 管理菜单测试
 
-在源码目录运行 `python3 test-menu.py`。测试使用临时配置和模拟服务，不会启停真实代理或写入系统目录。Linux 使用伪终端验证交互；Windows 可使用 Git Bash 运行模拟交互测试。
+在源码目录运行 `python3 test-menu.py`。测试使用临时配置和模拟服务，不会启停真实代理或写入系统目录。Linux 使用伪终端验证交互；Windows 可使用 Git Bash 运行模拟交互测试，会跳过需要伪终端的用例。
 
 ## ⚠️ 注意事项
 
