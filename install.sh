@@ -47,6 +47,23 @@ msg()   { echo -e "${GREEN}[✓]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
 err()   { echo -e "${RED}[✗]${NC} $*"; exit 1; }
 info()  { echo -e "${CYAN}[i]${NC} $*"; }
+# 文字进度条只反映真实阶段，不做计时动画。
+step() {
+    local n="$1" total="$2" label="$3" bar="" i
+    for ((i=1; i<=total; i++)); do
+        if (( i <= n )); then bar+='='; else bar+='-'; fi
+    done
+    info "[${bar}] ${n}/${total} ${label}"
+}
+
+# 交互终端显示 curl 单行实时进度条，非终端静默但保留错误输出，避免污染日志。
+curl_progress_flag() {
+    if [[ -t 1 ]]; then
+        echo "--progress-bar"
+    else
+        echo "--silent --show-error"
+    fi
+}
 
 check_root() {
     [[ $EUID -eq 0 ]] || err "请使用 root 权限运行此脚本 (sudo bash ...)"
@@ -99,19 +116,25 @@ install_deps() {
     info "安装必要依赖..."
     case "$PKG_MGR" in
         apt)
+            info "正在同步软件源（apt-get update），首次可能较慢..."
             apt-get update -qq
+            info "正在安装 curl wget tar gzip..."
             apt-get install -y -qq curl wget tar gzip >/dev/null 2>&1
             ;;
         yum)
+            info "正在安装 curl wget tar gzip（yum），首次可能较慢..."
             yum install -y -q curl wget tar gzip >/dev/null 2>&1
             ;;
         apk)
+            info "正在安装 curl wget tar gzip（apk）..."
             apk add --no-cache curl wget tar gzip >/dev/null 2>&1
             ;;
         pacman)
+            info "正在同步软件源并安装依赖（pacman -Sy），首次可能较慢..."
             pacman -Sy --noconfirm curl wget tar gzip >/dev/null 2>&1
             ;;
         zypper)
+            info "正在安装 curl wget tar gzip（zypper），首次可能较慢..."
             zypper install -y -q curl wget tar gzip >/dev/null 2>&1
             ;;
         *)
@@ -1033,13 +1056,15 @@ download_gost() {
     info "下载 gost v${GOST_VERSION} (${ARCH})..."
     local filename="gost_${GOST_VERSION}_linux_${ARCH}.tar.gz"
     local url="${GOST_REPO}/${filename}"
-    local tmp_dir
+    local tmp_dir progress
     tmp_dir="$(mktemp -d)"
+    progress="$(curl_progress_flag)"
 
-    if ! curl -fsSL --retry 3 --connect-timeout 10 -o "${tmp_dir}/${filename}" "$url"; then
+    if ! curl -fL --retry 3 --connect-timeout 10 ${progress} -o "${tmp_dir}/${filename}" "$url"; then
         err "下载失败，请检查网络连接后重试"
     fi
 
+    info "解压 gost..."
     tar -xzf "${tmp_dir}/${filename}" -C "${tmp_dir}"
     cp "${tmp_dir}/gost" "$GOST_BIN"
     chmod +x "$GOST_BIN"
@@ -1109,7 +1134,9 @@ do_upgrade() (
             tmp=$(mktemp /tmp/gost-routed.XXXXXX) || err "无法创建临时文件"
             trap 'if [[ -n "$tmp" ]]; then rm -f -- "$tmp"; fi' EXIT
             info "正在下载升级包..."
-            curl -fL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 300 -o "$tmp" "$1" ||
+            local progress
+            progress="$(curl_progress_flag)"
+            curl -fL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 300 ${progress} -o "$tmp" "$1" ||
                 err "下载失败：$1"
             [[ -s "$tmp" ]] || err "下载内容为空：$1"
             chmod 700 "$tmp"
@@ -1289,7 +1316,11 @@ do_install() (
     bash "$work/socks5" _generate "$S5_PORT" "$work/users" > "$work/config"
     bash "$work/socks5" _route_check "$ROUTED_BIN"
     write_service "$work/service"
+
+    step 1 4 "下载 gost 二进制"
     download_gost
+
+    step 2 4 "安装配置与管理命令"
     install -m 600 -- "$work/users" "$USERS_FILE"
     install -m 600 -- "$work/config" "$CONFIG_FILE"
     install -m 755 -- "$work/socks5" "$SOCKS5_CMD"
@@ -1297,9 +1328,12 @@ do_install() (
     # 保留安装脚本副本，供管理菜单内的升级使用。
     save_installer
 
+    step 3 4 "配置防火墙"
     configure_firewall "$S5_PORT"
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+
+    step 4 4 "启动服务并验证端口监听"
     bash "$SOCKS5_CMD" _restart || { systemctl stop "$SERVICE_NAME" || true; err "服务未监听预期端口，请查看服务日志"; }
     msg "服务已启动并设置开机自启"
     rm -rf -- "$work"
