@@ -112,35 +112,75 @@ detect_arch() {
 }
 
 # ============ 依赖安装 ============
+# apt 输出直接显示，用户能看到下载进度；首次开机 cloud-init 同时同步软件源会撞锁，
+# 命中锁冲突时自动等待重试；镜像索引未同步（unexpected size）等瞬时错误也会重试。
+apt_run() {
+    local log attempt rc=1
+    log=$(mktemp) || return 1
+    for attempt in 1 2 3; do
+        if apt-get "$@" \
+            -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 \
+            -o Acquire::Retries=2 2>&1 | tee "$log"; then
+            rc=0
+            break
+        fi
+        if grep -qiE 'could not get lock|unable to acquire the dpkg|is another process using it' "$log"; then
+            warn "apt 锁被其他进程占用（开机自动更新中），10 秒后重试（${attempt}/3）..."
+        elif grep -qiE 'unexpected size|mirror sync in progress|hash sum mismatch' "$log"; then
+            warn "镜像索引正在同步，10 秒后重试（${attempt}/3）..."
+        else
+            break
+        fi
+        sleep 10
+    done
+    rm -f -- "$log"
+    return "$rc"
+}
+
 install_deps() {
-    info "安装必要依赖..."
+    local pkg missing=()
+    # 脚本只用 curl 下载；wget 不参与流程，不再强制要求。
+    for pkg in curl tar gzip; do
+        command -v "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+    done
+    if (( ${#missing[@]} == 0 )); then
+        info "依赖已齐全（curl tar gzip），跳过安装"
+        return 0
+    fi
+    info "缺少依赖：${missing[*]}"
     case "$PKG_MGR" in
         apt)
             info "正在同步软件源（apt-get update），首次可能较慢..."
-            apt-get update -qq
-            info "正在安装 curl wget tar gzip..."
-            apt-get install -y -qq curl wget tar gzip >/dev/null 2>&1
+            apt_run update || warn "软件源同步未成功，继续尝试安装（本地缓存可能仍可用）"
+            info "正在安装 curl tar gzip..."
+            apt_run install -y curl tar gzip ||
+                warn "apt 安装未成功，继续检查依赖是否已具备"
             ;;
         yum)
-            info "正在安装 curl wget tar gzip（yum），首次可能较慢..."
-            yum install -y -q curl wget tar gzip >/dev/null 2>&1
+            info "正在安装 curl tar gzip（yum），首次可能较慢..."
+            yum install -y -q curl tar gzip >/dev/null 2>&1
             ;;
         apk)
-            info "正在安装 curl wget tar gzip（apk）..."
-            apk add --no-cache curl wget tar gzip >/dev/null 2>&1
+            info "正在安装 curl tar gzip（apk）..."
+            apk add --no-cache curl tar gzip >/dev/null 2>&1
             ;;
         pacman)
             info "正在同步软件源并安装依赖（pacman -Sy），首次可能较慢..."
-            pacman -Sy --noconfirm curl wget tar gzip >/dev/null 2>&1
+            pacman -Sy --noconfirm curl tar gzip >/dev/null 2>&1
             ;;
         zypper)
-            info "正在安装 curl wget tar gzip（zypper），首次可能较慢..."
-            zypper install -y -q curl wget tar gzip >/dev/null 2>&1
+            info "正在安装 curl tar gzip（zypper），首次可能较慢..."
+            zypper install -y -q curl tar gzip >/dev/null 2>&1
             ;;
         *)
-            warn "未知包管理器，请确保已安装 curl wget tar"
+            warn "未知包管理器，请确保已安装 curl tar"
             ;;
     esac
+    missing=()
+    for pkg in curl tar gzip; do
+        command -v "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+    done
+    (( ${#missing[@]} == 0 )) || err "依赖安装失败，仍缺少：${missing[*]}；请手动安装后重试"
     msg "依赖安装完成"
 }
 
@@ -1272,6 +1312,7 @@ do_install() (
         systemctl stop "$SERVICE_NAME" 2>/dev/null || true
     fi
 
+    step 1 5 "安装系统依赖"
     install_deps
 
     # 端口
@@ -1317,10 +1358,10 @@ do_install() (
     bash "$work/socks5" _route_check "$ROUTED_BIN"
     write_service "$work/service"
 
-    step 1 4 "下载 gost 二进制"
+    step 2 5 "下载 gost 二进制"
     download_gost
 
-    step 2 4 "安装配置与管理命令"
+    step 3 5 "安装配置与管理命令"
     install -m 600 -- "$work/users" "$USERS_FILE"
     install -m 600 -- "$work/config" "$CONFIG_FILE"
     install -m 755 -- "$work/socks5" "$SOCKS5_CMD"
@@ -1328,12 +1369,12 @@ do_install() (
     # 保留安装脚本副本，供管理菜单内的升级使用。
     save_installer
 
-    step 3 4 "配置防火墙"
+    step 4 5 "配置防火墙"
     configure_firewall "$S5_PORT"
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
 
-    step 4 4 "启动服务并验证端口监听"
+    step 5 5 "启动服务并验证端口监听"
     bash "$SOCKS5_CMD" _restart || { systemctl stop "$SERVICE_NAME" || true; err "服务未监听预期端口，请查看服务日志"; }
     msg "服务已启动并设置开机自启"
     rm -rf -- "$work"
